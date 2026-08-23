@@ -1026,12 +1026,18 @@ pub(crate) struct BreakdownRates {
 }
 
 /// DeepSeek peak windows are Beijing time (UTC+8): 09:00–12:00 and 14:00–18:00.
-/// Off-peak is exactly half price. Since 2026-08-23 (Beijing) weekends
-/// (Sat/Sun) are all-day off-peak. Pure so it is unit-testable at fixed instants.
+/// Off-peak is exactly half price. Since 2026-08-23 00:00 Beijing (instant
+/// `2026-08-22T16:00:00Z` = 1787414400) weekends (Sat/Sun) are all-day off-peak;
+/// before that instant the old weekday windows apply. Gated so a call with a
+/// past instant never silently reprices a pre-rule weekend. Pure so it is
+/// unit-testable at fixed instants.
+const WEEKEND_OFFPEAK_FROM: i64 = 1_787_414_400;
 pub(crate) fn is_beijing_peak(now: chrono::DateTime<chrono::Utc>) -> bool {
     use chrono::{Datelike, Timelike};
     let bj = now + chrono::Duration::hours(8);
-    if matches!(bj.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+    if now.timestamp() >= WEEKEND_OFFPEAK_FROM
+        && matches!(bj.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
+    {
         return false;
     }
     let bj_hour = bj.time().hour();
@@ -1413,7 +1419,7 @@ mod tests {
 
     #[test]
     fn beijing_peak_windows_match_official() {
-        use chrono::{TimeZone, Utc};
+        use chrono::{Datelike, TimeZone, Utc};
         let at = |utc_h: u32, utc_min: u32| {
             Utc.with_ymd_and_hms(2026, 8, 17, utc_h, utc_min, 0)
                 .unwrap()
@@ -1429,13 +1435,21 @@ mod tests {
         // Off-peak middle.
         assert!(!is_beijing_peak(at(0, 0)), "midnight Beijing");
         assert!(!is_beijing_peak(at(12, 0)), "20:00 Beijing");
-        // Weekends (Sat/Sun Beijing) are all-day off-peak since 2026-08-23:
-        // even inside a weekday peak window (10:00 Beijing = 02:00 UTC).
+        // Weekends (Sat/Sun Beijing) are all-day off-peak only since the
+        // effective instant 2026-08-22T16:00:00Z (=1787414400, 00:00 Beijing
+        // Aug 23). A Saturday *before* that instant still follows the weekday
+        // windows (10:00 Beijing = 02:00 UTC is peak); after it, off-peak.
         let wknd = |day: u32, utc_h: u32| Utc.with_ymd_and_hms(2026, 8, day, utc_h, 0, 0).unwrap();
-        assert!(!is_beijing_peak(wknd(22, 2)), "Sat 10:00 Beijing off-peak");
+        assert!(is_beijing_peak(wknd(22, 2)), "pre-rule Sat 10:00 Beijing still peak");
         assert!(!is_beijing_peak(wknd(23, 2)), "Sun 10:00 Beijing off-peak");
-        assert!(!is_beijing_peak(wknd(22, 7)), "Sat 15:00 Beijing off-peak");
+        assert!(!is_beijing_peak(wknd(29, 2)), "Sat 10:00 Beijing off-peak");
         assert!(!is_beijing_peak(wknd(23, 7)), "Sun 15:00 Beijing off-peak");
+        assert!(!is_beijing_peak(wknd(29, 7)), "Sat 15:00 Beijing off-peak");
+        // Boundary: exactly at the effective instant (16:00 UTC Fri Aug 22
+        // = 00:00 Beijing Sat Aug 23) the weekend rule applies.
+        let eff = Utc.timestamp_opt(WEEKEND_OFFPEAK_FROM, 0).unwrap();
+        assert!(eff.weekday() == chrono::Weekday::Sat, "instant is a Beijing Saturday");
+        assert!(!is_beijing_peak(eff), "effective instant itself is off-peak (weekend)");
     }
 
     #[test]
