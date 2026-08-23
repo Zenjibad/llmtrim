@@ -1026,10 +1026,15 @@ pub(crate) struct BreakdownRates {
 }
 
 /// DeepSeek peak windows are Beijing time (UTC+8): 09:00–12:00 and 14:00–18:00.
-/// Off-peak is exactly half price. Pure so it is unit-testable at fixed instants.
+/// Off-peak is exactly half price. Since 2026-08-23 (Beijing) weekends
+/// (Sat/Sun) are all-day off-peak. Pure so it is unit-testable at fixed instants.
 pub(crate) fn is_beijing_peak(now: chrono::DateTime<chrono::Utc>) -> bool {
-    use chrono::Timelike;
-    let bj_hour = (now + chrono::Duration::hours(8)).time().hour();
+    use chrono::{Datelike, Timelike};
+    let bj = now + chrono::Duration::hours(8);
+    if matches!(bj.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+        return false;
+    }
+    let bj_hour = bj.time().hour();
     (9..12).contains(&bj_hour) || (14..18).contains(&bj_hour)
 }
 
@@ -1424,6 +1429,13 @@ mod tests {
         // Off-peak middle.
         assert!(!is_beijing_peak(at(0, 0)), "midnight Beijing");
         assert!(!is_beijing_peak(at(12, 0)), "20:00 Beijing");
+        // Weekends (Sat/Sun Beijing) are all-day off-peak since 2026-08-23:
+        // even inside a weekday peak window (10:00 Beijing = 02:00 UTC).
+        let wknd = |day: u32, utc_h: u32| Utc.with_ymd_and_hms(2026, 8, day, utc_h, 0, 0).unwrap();
+        assert!(!is_beijing_peak(wknd(22, 2)), "Sat 10:00 Beijing off-peak");
+        assert!(!is_beijing_peak(wknd(23, 2)), "Sun 10:00 Beijing off-peak");
+        assert!(!is_beijing_peak(wknd(22, 7)), "Sat 15:00 Beijing off-peak");
+        assert!(!is_beijing_peak(wknd(23, 7)), "Sun 15:00 Beijing off-peak");
     }
 
     #[test]
