@@ -21,6 +21,7 @@
 //! wired (trivially safe: the contract — port + CA — is already in place, same as `start`).
 
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 use crate::ui::{self, Tone};
 
@@ -172,7 +173,7 @@ fn agent_is_dsh(agent: &str) -> bool {
 
 /// First directory on `PATH` that contains a shim named `bin` (bare, `.exe`, `.cmd`,
 /// or `.ps1`). `path_env` is a seam for tests; `None` reads the live environment.
-fn shim_dir_on_path(bin: &str, path_env: Option<&str>) -> Option<std::path::PathBuf> {
+fn shim_dir_on_path(bin: &str, path_env: Option<&str>) -> Option<PathBuf> {
     let path = match path_env {
         Some(p) => p.to_string(),
         None => std::env::var_os("PATH")?.to_string_lossy().into_owned(),
@@ -186,9 +187,23 @@ fn shim_dir_on_path(bin: &str, path_env: Option<&str>) -> Option<std::path::Path
     std::env::split_paths(&path).find(|dir| names.iter().any(|n| dir.join(n).is_file()))
 }
 
+/// Directory of an explicitly passed shim path such as `C:\Users\me\npm\dsh.cmd`.
+fn explicit_shim_dir(agent: &str) -> Option<PathBuf> {
+    let path = Path::new(agent);
+    if path.components().count() <= 1 || !path.is_file() {
+        return None;
+    }
+    path.parent().map(Path::to_path_buf)
+}
+
+/// Resolve either an explicit shim path or the first PATH shim directory.
+fn dsh_shim_dir(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
+    explicit_shim_dir(agent).or_else(|| shim_dir_on_path("dsh", path_env))
+}
+
 /// Derive the npm-installed entry script next to a `dsh` shim, if present.
-fn dsh_node_entry(path_env: Option<&str>) -> Option<std::path::PathBuf> {
-    let dir = shim_dir_on_path("dsh", path_env)?;
+fn dsh_node_entry(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
+    let dir = dsh_shim_dir(agent, path_env)?;
     let entry = dir
         .join("node_modules")
         .join("@deepseek-ai")
@@ -210,15 +225,24 @@ fn resolve_launch(
     args: &[String],
     path_env: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
-    if cfg!(windows) && agent_is_dsh(agent) {
-        if let Some(entry) = dsh_node_entry(path_env) {
+    resolve_launch_for_platform(agent, args, path_env, cfg!(windows))
+}
+
+fn resolve_launch_for_platform(
+    agent: &str,
+    args: &[String],
+    path_env: Option<&str>,
+    is_windows: bool,
+) -> Result<(String, Vec<String>)> {
+    if is_windows && agent_is_dsh(agent) {
+        if let Some(entry) = dsh_node_entry(agent, path_env) {
             let mut final_args = Vec::with_capacity(args.len() + 1);
             final_args.push(entry.to_string_lossy().into_owned());
             final_args.extend(args.iter().cloned());
             return Ok(("node".to_string(), final_args));
         }
         // dsh shim present but entry missing → actionable hint.
-        if shim_dir_on_path("dsh", path_env).is_some() {
+        if dsh_shim_dir(agent, path_env).is_some() {
             anyhow::bail!(
                 "found the `dsh` shim but no `node_modules\\@deepseek-ai\\dsh\\lib\\bin.js` \
                  beside it — run `npm install -g @deepseek-ai/dsh` and try again"
@@ -356,7 +380,6 @@ mod tests {
         assert_eq!(out, ("codex".to_string(), Vec::<String>::new()));
     }
 
-    #[cfg(windows)]
     #[test]
     fn dsh_resolves_to_node_entry_when_shim_and_entry_present() {
         let dir = std::env::temp_dir().join(format!("llmtrim-wrap-test-{}", std::process::id()));
@@ -380,7 +403,8 @@ mod tests {
         .expect("entry");
 
         let path = dir.to_string_lossy().into_owned();
-        let out = resolve_launch("dsh", &s(&["web"]), Some(path.as_str())).expect("resolve");
+        let out = resolve_launch_for_platform("dsh", &s(&["web"]), Some(path.as_str()), true)
+            .expect("resolve");
         assert_eq!(out.0, "node");
         assert_eq!(out.1.len(), 2);
         assert!(
@@ -392,7 +416,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(windows)]
+    #[test]
+    fn dsh_resolves_explicit_shim_path_to_adjacent_node_entry() {
+        let dir =
+            std::env::temp_dir().join(format!("llmtrim-wrap-explicit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(
+            dir.join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh")
+                .join("lib"),
+        )
+        .expect("mkdir");
+        let shim = dir.join("dsh.cmd");
+        std::fs::write(&shim, "@echo off\r\nexit /b 0\r\n").expect("shim");
+        std::fs::write(
+            dir.join("node_modules")
+                .join("@deepseek-ai")
+                .join("dsh")
+                .join("lib")
+                .join("bin.js"),
+            "#!/usr/bin/env node\r\n",
+        )
+        .expect("entry");
+
+        let out = resolve_launch_for_platform(
+            shim.to_string_lossy().as_ref(),
+            &s(&["web"]),
+            Some(""),
+            true,
+        )
+        .expect("resolve");
+        assert_eq!(out.0, "node");
+        assert_eq!(out.1.len(), 2);
+        assert!(
+            out.1[0].ends_with("node_modules\\@deepseek-ai\\dsh\\lib\\bin.js")
+                || out.1[0].ends_with("node_modules/@deepseek-ai/dsh/lib/bin.js")
+        );
+        assert_eq!(out.1[1], "web");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dsh_with_shim_but_no_entry_returns_npm_install_hint() {
         let dir = std::env::temp_dir().join(format!("llmtrim-wrap-missing-{}", std::process::id()));
@@ -401,7 +466,26 @@ mod tests {
         std::fs::write(dir.join("dsh.cmd"), "@echo off\r\nexit /b 0\r\n").expect("shim");
 
         let path = dir.to_string_lossy().into_owned();
-        let err = resolve_launch("dsh", &[], Some(path.as_str())).expect_err("should error");
+        let err = resolve_launch_for_platform("dsh", &[], Some(path.as_str()), true)
+            .expect_err("should error");
+        assert!(err.to_string().contains("npm install -g @deepseek-ai/dsh"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_dsh_shim_without_entry_returns_npm_install_hint() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmtrim-wrap-explicit-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let shim = dir.join("dsh.cmd");
+        std::fs::write(&shim, "@echo off\r\nexit /b 0\r\n").expect("shim");
+
+        let err = resolve_launch_for_platform(shim.to_string_lossy().as_ref(), &[], Some(""), true)
+            .expect_err("should error");
         assert!(err.to_string().contains("npm install -g @deepseek-ai/dsh"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -411,7 +495,8 @@ mod tests {
     fn dsh_not_on_path_resolves_to_itself() {
         // No dsh shim anywhere on PATH → generic behavior (the later exec error
         // handles the not-found case, matching today's semantics for any agent).
-        let out = resolve_launch("dsh", &[], Some("C:\\other")).expect("generic");
+        let out =
+            resolve_launch_for_platform("dsh", &[], Some("C:\\other"), true).expect("generic");
         assert_eq!(out, ("dsh".to_string(), Vec::<String>::new()));
     }
 }
