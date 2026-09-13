@@ -64,6 +64,7 @@
 "deep-research-preview-04-2026": 131072,
 "deepcogito/cogito-v2.1-671b": 128000,
 "deepseek-chat": 1000000,
+"deepseek-flash": 1000000,
 "deepseek-reasoner": 1000000,
 "deepseek-v4-flash": 1000000,
 "deepseek-v4-pro": 1000000,

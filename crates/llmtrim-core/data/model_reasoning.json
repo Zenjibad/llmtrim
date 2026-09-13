@@ -65,6 +65,7 @@
 "deep-research-preview-04-2026": true,
 "deepcogito/cogito-v2.1-671b": true,
 "deepseek-chat": false,
+"deepseek-flash": true,
 "deepseek-reasoner": true,
 "deepseek-v4-flash": true,
 "deepseek-v4-pro": true,
