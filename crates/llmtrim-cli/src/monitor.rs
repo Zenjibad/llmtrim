@@ -1448,7 +1448,10 @@ mod tests {
         // Aug 23). A Saturday *before* that instant still follows the weekday
         // windows (10:00 Beijing = 02:00 UTC is peak); after it, off-peak.
         let wknd = |day: u32, utc_h: u32| Utc.with_ymd_and_hms(2026, 8, day, utc_h, 0, 0).unwrap();
-        assert!(is_beijing_peak(wknd(22, 2)), "pre-rule Sat 10:00 Beijing still peak");
+        assert!(
+            is_beijing_peak(wknd(22, 2)),
+            "pre-rule Sat 10:00 Beijing still peak"
+        );
         assert!(!is_beijing_peak(wknd(23, 2)), "Sun 10:00 Beijing off-peak");
         assert!(!is_beijing_peak(wknd(29, 2)), "Sat 10:00 Beijing off-peak");
         assert!(!is_beijing_peak(wknd(23, 7)), "Sun 15:00 Beijing off-peak");
@@ -1456,8 +1459,14 @@ mod tests {
         // Boundary: exactly at the effective instant (16:00 UTC Fri Aug 22
         // = 00:00 Beijing Sat Aug 23) the weekend rule applies.
         let eff = Utc.timestamp_opt(WEEKEND_OFFPEAK_FROM, 0).unwrap();
-        assert!(eff.weekday() == chrono::Weekday::Sat, "instant is a Beijing Saturday");
-        assert!(!is_beijing_peak(eff), "effective instant itself is off-peak (weekend)");
+        assert!(
+            eff.weekday() == chrono::Weekday::Sat,
+            "instant is a Beijing Saturday"
+        );
+        assert!(
+            !is_beijing_peak(eff),
+            "effective instant itself is off-peak (weekend)"
+        );
     }
 
     #[test]
