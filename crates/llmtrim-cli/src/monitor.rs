@@ -1044,31 +1044,39 @@ pub(crate) fn is_beijing_peak(now: chrono::DateTime<chrono::Utc>) -> bool {
     (9..12).contains(&bj_hour) || (14..18).contains(&bj_hour)
 }
 
-/// Baked CNY→USD rate for DeepSeek's official pricing (元 per 1M tokens).
-/// DeepSeek bills in CNY with no USD endpoint for these tiers; a fixed FX keeps
-/// savings estimates stable without a live-currency dependency. Revisit if the
-/// official USD list appears.
-const DEEPSEEK_USD_FX: f64 = 7.2;
-
 fn deepseek_bare_model(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
 /// Official DeepSeek (peak, off-peak) USD rate tuples, or `None` for models
 /// outside flash/pro scope. Peak is exactly 2× off-peak.
+///
+/// USD-native: DeepSeek publishes these three tiers in USD (the EN pricing page),
+/// llmtrim displays USD, and every other provider is priced from its published
+/// USD list — so nothing is converted here. The zh-cn page carries the same tiers
+/// in CNY (flash ¥0.02/¥1/¥4, pro ¥0.15/¥4.5/¥13.5), but the two lists are *not*
+/// one FX apart (the USD column implies ~6.67 for flash and ~6.82 for pro), so
+/// dividing one by a baked rate would invent a number no vendor publishes. A
+/// CNY-billed account is served by a `billing = usd | cny` switch over the two
+/// published lists, not by an FX constant.
 fn deepseek_rates(model: &str) -> Option<(BreakdownRates, BreakdownRates)> {
-    // Official CNY per 1M (hit, miss, output) — off-peak then peak (2×).
+    // Official USD per 1M (hit, miss, output) — off-peak (peak is 2×).
     let (hit_off, miss_off, out_off) = match deepseek_bare_model(model) {
-        "deepseek-v4-flash" => (0.05, 1.5, 4.5),
-        // Vision-exp bills at the same tiers as v4-flash.
-        "deepseek-v4-flash-vision-exp" => (0.05, 1.5, 4.5),
-        "deepseek-v4-pro" => (0.15, 4.5, 13.5),
+        // `deepseek-flash` (DeepSeek-V4.1-Flash) is the current id; the restructure
+        // also halved its hit/miss/out tiers. The two legacy names are retired
+        // models still accepted on the wire; their requests are served by
+        // V4.1-Flash and billed at the Flash price.
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp" => {
+            (0.003, 0.15, 0.6)
+        }
+        // Unchanged by the restructure.
+        "deepseek-v4-pro" => (0.022, 0.66, 1.98),
         _ => return None,
     };
     let tier = |hit, miss, out| BreakdownRates {
-        input: miss / DEEPSEEK_USD_FX,
-        output: out / DEEPSEEK_USD_FX,
-        cache_read: hit / DEEPSEEK_USD_FX,
+        input: miss,
+        output: out,
+        cache_read: hit,
         // DeepSeek has no cache-write surcharge; write tokens bill as miss input.
         cache_write: 0.0,
     };
@@ -1453,22 +1461,22 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_rates_match_official_usd_at_baked_fx() {
-        let (peak, off) = deepseek_rates("deepseek-v4-flash").expect("flash priced");
-        let fx = 7.2;
-        // Official off-peak CNY per 1M: hit ¥0.05, miss ¥1.5, out ¥4.5.
+    fn deepseek_rates_match_official_usd() {
+        let (peak, off) = deepseek_rates("deepseek-flash").expect("flash priced");
+        // Official off-peak USD per 1M: hit $0.003, miss $0.15, out $0.60 — the
+        // vendor's own USD list, not the CNY table at any FX.
         assert!(
-            (off.input - 1.5 / fx).abs() < 1e-6,
+            (off.input - 0.15).abs() < 1e-9,
             "flash off miss {}",
             off.input
         );
         assert!(
-            (off.cache_read - 0.05 / fx).abs() < 1e-6,
+            (off.cache_read - 0.003).abs() < 1e-9,
             "flash off hit {}",
             off.cache_read
         );
         assert!(
-            (off.output - 4.5 / fx).abs() < 1e-6,
+            (off.output - 0.6).abs() < 1e-9,
             "flash off out {}",
             off.output
         );
@@ -1478,29 +1486,41 @@ mod tests {
         assert!((peak.cache_read - off.cache_read * 2.0).abs() < 1e-9);
         assert!((peak.output - off.output * 2.0).abs() < 1e-9);
 
-        // Vision-exp bills at exactly the same tiers as v4-flash.
-        let (vpeak, voff) = deepseek_rates("deepseek-v4-flash-vision-exp").expect("vision priced");
-        let (fpeak, foff) = deepseek_rates("deepseek-v4-flash").expect("flash priced");
-        assert_eq!(voff.input, foff.input);
-        assert_eq!(voff.cache_read, foff.cache_read);
-        assert_eq!(voff.output, foff.output);
-        assert_eq!(vpeak.input, fpeak.input);
-        assert_eq!(vpeak.cache_read, fpeak.cache_read);
-        assert_eq!(vpeak.output, fpeak.output);
+        // The legacy ids are retired but still accepted, served as V4.1-Flash at the
+        // Flash price — including through a `provider/id` prefix.
+        for alias in [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek/deepseek-flash",
+        ] {
+            let (p, o) = deepseek_rates(alias).expect("alias priced");
+            assert_eq!(
+                (o.input, o.output, o.cache_read),
+                (off.input, off.output, off.cache_read),
+                "{alias} off-peak"
+            );
+            assert_eq!(
+                (p.input, p.output, p.cache_read),
+                (peak.input, peak.output, peak.cache_read),
+                "{alias} peak"
+            );
+        }
 
         let (peak, off) = deepseek_rates("deepseek-v4-pro").expect("pro priced");
+        // Official off-peak USD per 1M: hit $0.022, miss $0.66, out $1.98 — unchanged
+        // by the restructure, so pro must not move when flash is repriced.
         assert!(
-            (off.input - 4.5 / fx).abs() < 1e-6,
+            (off.input - 0.66).abs() < 1e-9,
             "pro off miss {}",
             off.input
         );
         assert!(
-            (off.cache_read - 0.15 / fx).abs() < 1e-6,
+            (off.cache_read - 0.022).abs() < 1e-9,
             "pro off hit {}",
             off.cache_read
         );
         assert!(
-            (off.output - 13.5 / fx).abs() < 1e-6,
+            (off.output - 1.98).abs() < 1e-9,
             "pro off out {}",
             off.output
         );
