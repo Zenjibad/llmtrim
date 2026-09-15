@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-09-15
+
 ### Fixed
 
 - **Source-file tool results are no longer windowed.** Claude Code `Read` (and
@@ -1760,7 +1762,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.5...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.6...HEAD
+[0.13.6]: https://github.com/fkiene/llmtrim/compare/v0.13.5...v0.13.6
 [0.13.5]: https://github.com/fkiene/llmtrim/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/fkiene/llmtrim/compare/v0.13.3...v0.13.4
 [0.13.3]: https://github.com/fkiene/llmtrim/compare/v0.13.2...v0.13.3
