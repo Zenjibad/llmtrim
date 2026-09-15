@@ -1062,10 +1062,10 @@ fn deepseek_bare_model(model: &str) -> &str {
 fn deepseek_rates(model: &str) -> Option<(BreakdownRates, BreakdownRates)> {
     // Official USD per 1M (hit, miss, output) — off-peak (peak is 2×).
     let (hit_off, miss_off, out_off) = match deepseek_bare_model(model) {
-        // `deepseek-flash` (DeepSeek-V4.1-Flash) is the current id; the restructure
-        // also halved its hit/miss/out tiers. The two legacy names are retired
-        // models still accepted on the wire; their requests are served by
-        // V4.1-Flash and billed at the Flash price.
+        // `deepseek-flash` (DeepSeek-V4.1-Flash) is the current id; that release cut
+        // its tiers again (CNY per 1M: hit 0.05 -> 0.02, miss 1.5 -> 1, out 4.5 -> 4).
+        // The two legacy names are retired models still accepted on the wire; their
+        // requests are served by V4.1-Flash and billed at the Flash price.
         "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-vision-exp" => {
             (0.003, 0.15, 0.6)
         }
