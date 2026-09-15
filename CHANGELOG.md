@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-09-15
+
 ### Changed
 
 - **Interceptor replay/fallback no longer pins blocking threads.** Secondary upstream
@@ -1748,7 +1750,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.4...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.5...HEAD
+[0.13.5]: https://github.com/fkiene/llmtrim/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/fkiene/llmtrim/compare/v0.13.3...v0.13.4
 [0.13.3]: https://github.com/fkiene/llmtrim/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/fkiene/llmtrim/compare/v0.13.1...v0.13.2
