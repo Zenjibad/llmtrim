@@ -590,9 +590,9 @@ mod imp {
 
     /// Find the llmtrim insert block: a column-0 `- insert:` whose nested row is
     /// `- id: mcp-llmtrim`, running to the closing marker or the next top-level row. A column-0
-    /// `- id: mcp-llmtrim` is a dsh-mcp-toggle disable override, not a registration. Returns the
-    /// block's line range (BEGIN marker included) so the caller rewrites exactly what it found.
-    /// Pure.
+    /// `- id: mcp-llmtrim` is a patch override — the row a settings page or a hand edit uses to
+    /// enable or disable an entry — not a registration. Returns the block's line range (BEGIN
+    /// marker included) so the caller rewrites exactly what it found. Pure.
     fn dsh_entry(lines: &[String]) -> (DshEntry, Option<std::ops::Range<usize>>) {
         let mut i = 0;
         while i < lines.len() {
@@ -1172,7 +1172,7 @@ mod imp {
         #[test]
         fn dsh_entry_finds_only_insert_blocks() {
             assert_eq!(state_of(""), DshEntry::Absent);
-            // A column-0 row is a dsh-mcp-toggle disable override, not a registration.
+            // A column-0 row is a top-level patch override (enable/disable), not a registration.
             assert_eq!(
                 state_of("- id: mcp-llmtrim\n  disabled: true\n"),
                 DshEntry::Absent
