@@ -431,6 +431,50 @@ mod tests {
         assert_eq!(unknown.program, "nope");
     }
 
+    /// The launcher's contract is "never silent": the code this replaced dropped arguments
+    /// and reported success, which string assertions could not see. This spawns for real.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_shim_receives_its_arguments() {
+        let dir = tempdir("spawn");
+        let shim = dir.join("echoer.cmd");
+        std::fs::write(&shim, "@echo off\r\necho [%~1][%~2]\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch =
+            resolve_launch_for_platform("echoer", &s(&["plain", "has space"]), Some(&path), true)
+                .expect("resolve");
+        let out = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .output()
+            .expect("spawn");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("[plain]"), "stdout was {text:?}");
+        assert!(text.contains("[has space]"), "stdout was {text:?}");
+    }
+
+    /// A character cmd.exe treats specially: delivered intact, or refused by `Command` —
+    /// never silently dropped.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_shim_never_silently_drops_a_metacharacter_argument() {
+        let dir = tempdir("spawn-meta");
+        let shim = dir.join("echoer.cmd");
+        std::fs::write(&shim, "@echo off\r\necho [%1]\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch = resolve_launch_for_platform("echoer", &s(&["a&b"]), Some(&path), true)
+            .expect("resolve");
+        // Delivered intact, or refused by `Command` for being unescapable in a batch file
+        // (fail-closed and loud, where the old code was fail-silent). Only the Ok branch has
+        // anything to assert: an argument that arrives must not be mangled.
+        if let Ok(out) = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains("a&b"), "argument was mangled: {text:?}");
+        }
+    }
+
     #[test]
     fn unix_shim_passes_through_untouched() {
         let dir = tempdir("unix-shim");
