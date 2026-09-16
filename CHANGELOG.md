@@ -20,6 +20,12 @@ All notable changes to this project are documented here. The format follows
   and minted a fresh empty window on the way back, so window-local subscription
   routing did not start again for that session id. Resume now reattaches the
   same window and intent.
+- **`llmtrim wrap` launches npm shims on Windows.** `dsh`, `tsc`, and any other CLI npm
+  installs as a `.cmd`/`.ps1` shim now start correctly: the shim the shell would run is
+  resolved in PATHEXT order, `.cmd`/`.bat` are handed to Rust's own batch handling (which
+  escapes their arguments and refuses ones it cannot escape), and `.ps1` goes through
+  PowerShell. Previously a shim's arguments were silently dropped, and a `.cmd` could
+  shadow a native `.exe` of the same name.
 
 ## [0.13.6] - 2026-09-15
 
