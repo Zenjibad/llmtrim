@@ -94,8 +94,9 @@ pub fn run(raw: Vec<String>) -> Result<()> {
     let inv = parse_invocation(&raw)?;
     let color = ui::color_stdout();
 
-    // Resolve the real launch command up front (a Windows shim → `cmd /c` or PowerShell),
-    // so readiness hints and the "not found" error talk about the agent the user typed.
+    // Resolve what to launch up front — a Windows shim becomes its own program, a `.ps1` a
+    // PowerShell invocation — so the readiness hints and the "not found" error name the
+    // agent the user typed.
     let launch = resolve_launch(&inv.agent, &inv.args, None)?;
 
     // Reuse the exact helpers `start`/`setup` use — do not reimplement the checks.
@@ -250,10 +251,12 @@ fn resolve_launch(agent: &str, args: &[String], path_env: Option<&str>) -> Resul
 }
 
 /// On Windows a shim (`.cmd`/`.bat`/`.ps1`) is a script, not an executable, so `Command`
-/// cannot run it — and `Command` never consults `PATHEXT`, which is why a bare `dsh`
-/// looked for `dsh.exe` and missed `dsh.cmd`. Any agent is handled: `.cmd`/`.bat` go
-/// through `cmd /c`, `.ps1` through PowerShell `-File`. Everything else — including a
-/// POSIX shim, which is a shebang script — passes through untouched.
+/// cannot run it by name — and `Command` never consults `PATHEXT`, which is why a bare
+/// `dsh` looked for `dsh.exe` and missed `dsh.cmd`. The resolved `.cmd`/`.bat` path is
+/// handed to `Command`, which wraps batch files in `cmd.exe` and escapes their arguments
+/// itself (refusing ones it cannot escape). `.ps1` goes through PowerShell `-File`.
+/// Everything else — a native binary, an unknown name, a POSIX shim (a shebang script) —
+/// passes through untouched.
 fn resolve_launch_for_platform(
     agent: &str,
     args: &[String],
