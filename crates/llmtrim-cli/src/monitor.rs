@@ -1102,8 +1102,9 @@ fn deepseek_rates(model: &str) -> Option<(BreakdownRates, BreakdownRates)> {
         input: miss,
         output: out,
         cache_read: hit,
-        // DeepSeek has no cache-write surcharge; write tokens bill as miss input.
-        cache_write: 0.0,
+        // DeepSeek has no cache-write surcharge: write tokens bill as miss input. Zero here
+        // would price `cache_creation_input_tokens` on the Anthropic-shaped endpoint at $0.
+        cache_write: miss,
     };
     Some((
         tier(hit_off * 2.0, miss_off * 2.0, out_off * 2.0),
@@ -1534,7 +1535,19 @@ mod tests {
             "flash off out {}",
             off.output
         );
-        assert_eq!(off.cache_write, 0.0);
+        // A cache write has no surcharge and no discount: it bills as miss input, which is
+        // what the comment on the field says. On `api.deepseek.com/anthropic` a body
+        // carrying `cache_creation_input_tokens` prices at 0 if this is 0.0.
+        assert!(
+            (off.cache_write - off.input).abs() < 1e-9,
+            "flash write {}",
+            off.cache_write
+        );
+        assert!(
+            (peak.cache_write - peak.input).abs() < 1e-9,
+            "flash peak write {}",
+            peak.cache_write
+        );
         // Peak doubles all three.
         assert!((peak.input - off.input * 2.0).abs() < 1e-9);
         assert!((peak.cache_read - off.cache_read * 2.0).abs() < 1e-9);
