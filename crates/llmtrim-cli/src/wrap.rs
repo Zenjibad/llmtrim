@@ -215,6 +215,46 @@ fn dsh_node_entry(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
 
 /// Rewrite a `wrap` invocation into the real (program, args) to launch.
 ///
+/// Script extensions Rust's `Command` cannot exec directly on Windows.
+const SHIM_EXTS: &[&str] = &["cmd", "bat", "ps1"];
+
+/// Resolve `agent` to a Windows script shim, or `None` when it is not one.
+///
+/// A value containing a path separator is used as given (so `wrap C:\npm\dsh.cmd` works);
+/// a bare name is probed on PATH as given first, then with each shim extension. `.exe` and
+/// `.com` are deliberately not matched: `Command` finds those unaided, and routing them
+/// through `cmd.exe` would add a process and change quoting for every launch. `path_env`
+/// is a seam so tests never read the real environment.
+fn shim_path(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
+    fn is_shim(p: &Path) -> bool {
+        p.is_file()
+            && p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SHIM_EXTS.iter().any(|s| e.eq_ignore_ascii_case(s)))
+    }
+    if agent.contains(['/', '\\']) {
+        let p = PathBuf::from(agent);
+        return is_shim(&p).then_some(p);
+    }
+    let path = match path_env {
+        Some(p) => p.to_string(),
+        None => std::env::var("PATH").ok()?,
+    };
+    for dir in std::env::split_paths(&path) {
+        let as_given = dir.join(agent);
+        if is_shim(&as_given) {
+            return Some(as_given);
+        }
+        for ext in SHIM_EXTS {
+            let cand = dir.join(format!("{agent}.{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// Quote one token for a `cmd.exe` command line. `cmd` parses a *command line*, not an
 /// argv array, so Rust's MSVCRT quoting (what `Command::args` applies) is wrong here: we
 /// quote each token ourselves and hand the whole line over with `raw_arg`. Interior quotes
@@ -336,6 +376,44 @@ mod tests {
     fn cmd_line_quotes_shim_and_every_arg() {
         let line = cmd_line(Path::new("C:\\npm\\dsh.cmd"), &s(&["web", "a b"]));
         assert_eq!(line, "\"C:\\npm\\dsh.cmd\" \"web\" \"a b\"");
+    }
+
+    /// Scratch dir for a shim fixture. The existing tests inline this pattern; the shim
+    /// tests all want it, so it is named once.
+    fn tempdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("llmtrim-wrap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn shim_path_probes_extensions_on_path() {
+        let dir = tempdir("probe");
+        std::fs::write(dir.join("mytool.cmd"), "@echo off\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        assert_eq!(shim_path("mytool", Some(&path)), Some(dir.join("mytool.cmd")));
+        assert_eq!(
+            shim_path("mytool.cmd", Some(&path)),
+            Some(dir.join("mytool.cmd"))
+        );
+        assert_eq!(shim_path("missing", Some(&path)), None);
+    }
+
+    #[test]
+    fn shim_path_accepts_an_explicit_path() {
+        let dir = tempdir("explicit");
+        let shim = dir.join("dsh.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("shim");
+        let given = shim.to_string_lossy().into_owned();
+        assert_eq!(shim_path(&given, None), Some(shim));
+    }
+
+    #[test]
+    fn shim_path_ignores_exe() {
+        let dir = tempdir("exe");
+        std::fs::write(dir.join("mytool.exe"), b"MZ").expect("exe");
+        assert_eq!(shim_path("mytool", Some(&dir.to_string_lossy())), None);
     }
 
     #[test]
