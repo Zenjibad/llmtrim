@@ -1031,10 +1031,14 @@ pub(crate) struct BreakdownRates {
 /// what `calendar_offset_hours` is for: with the live windows the UTC and Beijing calendars
 /// agree at every peak instant, so only a schedule whose windows straddle that disagreement
 /// can catch a wrong-calendar read — see the vectors test.
+#[cfg(feature = "intercept")]
 const PEAK_WINDOWS_UTC: &[(u32, u32)] = &[(1, 4), (6, 10)];
+#[cfg(feature = "intercept")]
 const BEIJING_CALENDAR_OFFSET_HOURS: i64 = 8;
+#[cfg(feature = "intercept")]
 const WEEKEND_OFFPEAK_FROM: i64 = 1_787_414_400;
 
+#[cfg(feature = "intercept")]
 pub(crate) fn is_beijing_peak(now: chrono::DateTime<chrono::Utc>) -> bool {
     is_peak_at(
         now,
@@ -1047,6 +1051,7 @@ pub(crate) fn is_beijing_peak(now: chrono::DateTime<chrono::Utc>) -> bool {
 /// Peak test for an explicit schedule: half-open UTC hour windows, the instant the weekend
 /// rule took effect, and the calendar offset used to read the weekend weekday. Pure, so a
 /// test can pin any schedule at a fixed instant.
+#[cfg(feature = "intercept")]
 fn is_peak_at(
     now: chrono::DateTime<chrono::Utc>,
     peak_windows_utc: &[(u32, u32)],
@@ -1069,6 +1074,7 @@ fn is_peak_at(
         .any(|(start, end)| (*start..*end).contains(&hour))
 }
 
+#[cfg(feature = "intercept")]
 fn deepseek_bare_model(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
@@ -1084,6 +1090,7 @@ fn deepseek_bare_model(model: &str) -> &str {
 /// dividing one by a baked rate would invent a number no vendor publishes. A
 /// CNY-billed account is served by a `billing = usd | cny` switch over the two
 /// published lists, not by an FX constant.
+#[cfg(feature = "intercept")]
 fn deepseek_rates(model: &str) -> Option<(BreakdownRates, BreakdownRates)> {
     // Official USD per 1M (hit, miss, output) — off-peak (peak is 2×).
     let (hit_off, miss_off, out_off) = match deepseek_bare_model(model) {
@@ -1167,6 +1174,7 @@ fn cache_multipliers(provider: &str) -> (f64, f64) {
 /// ponytail: off-peak for every DeepSeek turn, so a peak-heavy day reads low on the cache
 /// share (peak is 2x). Ceiling accepted because the exact figure already exists in the
 /// frozen money path; upgrade by aggregating `breakdown_turns` rates here instead.
+#[cfg(feature = "intercept")]
 fn aggregate_rates(provider: &str, model: &str) -> BreakdownRates {
     if let Some((_peak, off_peak)) = deepseek_rates(model) {
         return off_peak;
@@ -1218,13 +1226,42 @@ pub fn cost_estimate(models: &[ModelRow]) -> Option<Cost> {
             cost.out_spend += out;
             cost.out_spend_shaped += m.output_after_shaped as f64 / 1_000_000.0 * output_price;
 
-            // Cache components come from the published rates, not the OpenAI multipliers:
-            // DeepSeek's cache read is its own tier ($0.003), not 0.50 x input.
-            let rates = aggregate_rates(&m.provider, model_id);
-            let net_bill = (m.fresh_input_est as f64 * rates.input
-                + m.cache_write as f64 * rates.cache_write
-                + m.cache_read as f64 * rates.cache_read)
-                / 1_000_000.0;
+            #[cfg(feature = "intercept")]
+            let (net_bill, live_rate) = {
+                // Cache components come from the published rates, not the OpenAI multipliers:
+                // DeepSeek's cache read is its own tier ($0.003), not 0.50 x input.
+                let rates = aggregate_rates(&m.provider, model_id);
+                let net_bill = (m.fresh_input_est as f64 * rates.input
+                    + m.cache_write as f64 * rates.cache_write
+                    + m.cache_read as f64 * rates.cache_read)
+                    / 1_000_000.0;
+                let live_used = m.fresh_input_est + m.cache_write;
+                let live_rate = if live_used > 0 && rates.input > 0.0 {
+                    (m.fresh_input_est as f64 * rates.input
+                        + m.cache_write as f64 * rates.cache_write)
+                        / (live_used as f64 * rates.input)
+                } else {
+                    1.0
+                };
+                (net_bill, live_rate)
+            };
+            #[cfg(not(feature = "intercept"))]
+            let (net_bill, live_rate) = {
+                let (read_mult, write_mult) = cache_multipliers(&m.provider);
+                let net_bill = (m.fresh_input_est as f64
+                    + m.cache_write as f64 * write_mult
+                    + m.cache_read as f64 * read_mult)
+                    / 1_000_000.0
+                    * input_price;
+                let live_used = m.fresh_input_est + m.cache_write;
+                let live_rate = if live_used > 0 {
+                    (m.fresh_input_est as f64 + m.cache_write as f64 * write_mult.max(1.0))
+                        / live_used as f64
+                } else {
+                    1.0
+                };
+                (net_bill, live_rate)
+            };
             // What was really paid for this model: cache-discounted input + measured output.
             cost.net_spend += net_bill + out;
             // The .min(0.95) clamp is load-bearing: it bounds the `1 - pct` denominator below
@@ -1239,13 +1276,6 @@ pub fn cost_estimate(models: &[ModelRow]) -> Option<Cost> {
             // fresh (1×) + cache writes (1.25× on Anthropic) — never at the ~10% read rate
             // the net blend assumes — so price the cut at that mix. No usage split recorded
             // → rate 1.0, degrading to the list figure.
-            let live_used = m.fresh_input_est + m.cache_write;
-            let live_rate = if live_used > 0 && rates.input > 0.0 {
-                (m.fresh_input_est as f64 * rates.input + m.cache_write as f64 * rates.cache_write)
-                    / (live_used as f64 * rates.input)
-            } else {
-                1.0
-            };
             cost.live_saved += delta / 1_000_000.0 * input_price * live_rate;
             matched = true;
         }
