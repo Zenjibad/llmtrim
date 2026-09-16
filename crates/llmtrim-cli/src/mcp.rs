@@ -464,15 +464,24 @@ mod imp {
         install_for_client(print, force, McpClient::Claude)
     }
 
-    /// Register with the requested client. `--print` skips every write.
-    ///
-    /// DeepSeek Harness is added by a later task; until then those values fail loudly rather than
-    /// quietly registering Claude Code for a user who asked for something else.
+    /// Register with the requested client. Claude Code is driven through its own `claude mcp add`
+    /// CLI (which owns the config file, so we don't hand-edit it); DeepSeek Harness has no such
+    /// CLI, so its user patch layer is written directly. Idempotent either way, with `--force` to
+    /// reinstall a stale entry. `--print` skips every write.
     pub fn install_for_client(print: bool, force: bool, client: McpClient) -> Result<()> {
         match client {
             McpClient::Claude => install_claude(print, force),
-            McpClient::Dsh | McpClient::All => {
-                anyhow::bail!("`--client dsh`/`all` is not implemented on this build yet")
+            McpClient::Dsh => install_dsh(print, force, true),
+            McpClient::All => {
+                if print {
+                    println!("# Claude Code");
+                    install_claude(true, force)?;
+                    println!("\n# DeepSeek Harness");
+                    return install_dsh(true, force, false);
+                }
+                // Both run; the first failure is reported, and a missing DSH never stops the
+                // Claude half (`install_dsh` is called with `required = false`).
+                install_claude(false, force).and(install_dsh(false, force, false))
             }
         }
     }
@@ -521,6 +530,254 @@ mod imp {
             Some(false) => anyhow::bail!("`claude mcp add` failed"),
             None => anyhow::bail!("the `claude` CLI vanished between checks"),
         }
+    }
+
+    // ── `--client dsh`: the DeepSeek Harness user patch layer ──────────────────────────
+
+    /// Marker comments around our `- insert:` block. They are the convention documented for
+    /// hand-written DSH entries, which is also what lets a re-run recognize a block the user
+    /// wrote by hand instead of appending a twin.
+    const DSH_BEGIN: &str = "# --- llmtrim MCP server ---";
+    const DSH_END: &str = "# --- end llmtrim MCP server ---";
+
+    /// The patch block that registers llmtrim with DSH: a loader row mounting the bundled
+    /// `@deepseek-ai/dsh-mcp-client` bridge, which re-exposes the tools as
+    /// `mcp__llmtrim__llmtrim_compress`, `…_compress_text` and `…_stats`. `command: llmtrim` is
+    /// the same launch command the Claude entry and the paste-this block use, and the bridge
+    /// spawns it through the MCP SDK's cross-spawn, which resolves an npm `.cmd` shim on Windows.
+    const DSH_BLOCK: &str = "\
+# --- llmtrim MCP server ---
+- insert:
+  - id: mcp-llmtrim
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: llmtrim
+      transport: stdio
+      command: llmtrim
+      args:
+        - mcp
+# --- end llmtrim MCP server ---
+";
+
+    /// What a patch file already says about the llmtrim row.
+    #[derive(Debug, PartialEq, Eq)]
+    enum DshEntry {
+        /// No `- insert:` block carries `id: mcp-llmtrim`.
+        Absent,
+        /// One does, and it launches `llmtrim mcp`.
+        Current,
+        /// One does, but it launches something else (a stale absolute path, another binary).
+        Stale,
+    }
+
+    /// Split a patch file into lines without their terminators, and report whether it used
+    /// CRLF so the write can restore the user's line ending. A trailing newline does not produce
+    /// a trailing empty entry. Pure.
+    fn split_patch(content: &str) -> (Vec<String>, bool) {
+        let crlf = content.contains("\r\n");
+        let mut lines: Vec<String> = content
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+            .collect();
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        (lines, crlf)
+    }
+
+    /// Find the llmtrim insert block: a column-0 `- insert:` whose nested row is
+    /// `- id: mcp-llmtrim`, running to the closing marker or the next top-level row. A column-0
+    /// `- id: mcp-llmtrim` is a dsh-mcp-toggle disable override, not a registration. Returns the
+    /// block's line range (BEGIN marker included) so the caller rewrites exactly what it found.
+    /// Pure.
+    fn dsh_entry(lines: &[String]) -> (DshEntry, Option<std::ops::Range<usize>>) {
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i] != "- insert:" {
+                i += 1;
+                continue;
+            }
+            let mut end = i + 1;
+            while end < lines.len() {
+                if lines[end].trim() == DSH_END {
+                    end += 1;
+                    break;
+                }
+                if lines[end].starts_with("- ") || lines[end] == "-" {
+                    break;
+                }
+                end += 1;
+            }
+            let block = &lines[i..end];
+            if block.iter().any(|l| l.trim() == "- id: mcp-llmtrim") {
+                let state = if launches_llmtrim(block) {
+                    DshEntry::Current
+                } else {
+                    DshEntry::Stale
+                };
+                let start = if i > 0 && lines[i - 1].trim() == DSH_BEGIN {
+                    i - 1
+                } else {
+                    i
+                };
+                return (state, Some(start..end));
+            }
+            i = end;
+        }
+        (DshEntry::Absent, None)
+    }
+
+    /// Does an insert block launch `llmtrim mcp`? Only the two lines llmtrim owns are compared,
+    /// so extra keys the user added to the block do not make it stale.
+    fn launches_llmtrim(block: &[String]) -> bool {
+        let command = block
+            .iter()
+            .find_map(|l| l.trim().strip_prefix("command:"))
+            .map(str::trim);
+        command == Some("llmtrim") && block.iter().any(|l| l.trim() == "- mcp")
+    }
+
+    /// What [`install_dsh_at`] did, so the caller can report it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum DshOutcome {
+        /// The file already registers us with the command we would write.
+        AlreadyRegistered,
+        /// The block was appended to the patch file.
+        Written,
+        /// An existing block was rewritten in place.
+        Rewritten,
+        /// An existing block differs and `--force` was not given.
+        Stale,
+    }
+
+    /// Append or refresh the llmtrim row in a DSH user patch layer. `path` is injected so tests
+    /// point at a temp file. A current entry is never written back — the file stays
+    /// byte-identical — because a second `- insert:` row for the same id mounts a second
+    /// mcp-client fiber on a `serverName` that is reserved while one is live. Only the block we
+    /// found is replaced; every other byte of the user's file is preserved.
+    fn install_dsh_at(path: &std::path::Path, force: bool) -> Result<DshOutcome> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let (mut lines, crlf) = split_patch(&content);
+        let (state, range) = dsh_entry(&lines);
+        let block: Vec<String> = DSH_BLOCK.lines().map(str::to_string).collect();
+        let outcome = match state {
+            DshEntry::Current => DshOutcome::AlreadyRegistered,
+            DshEntry::Stale if !force => DshOutcome::Stale,
+            DshEntry::Stale => match range {
+                Some(range) => {
+                    lines.splice(range, block);
+                    DshOutcome::Rewritten
+                }
+                // Unreachable: a `Stale` verdict always comes with the block it found. Appending
+                // is the safe reading of "we could not locate it".
+                None => {
+                    append_block(&mut lines, block);
+                    DshOutcome::Written
+                }
+            },
+            DshEntry::Absent => {
+                append_block(&mut lines, block);
+                DshOutcome::Written
+            }
+        };
+
+        if matches!(outcome, DshOutcome::AlreadyRegistered | DshOutcome::Stale) {
+            return Ok(outcome);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let eol = if crlf { "\r\n" } else { "\n" };
+        let mut text = lines.join(eol);
+        text.push_str(eol);
+        std::fs::write(path, text)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(outcome)
+    }
+
+    /// Add the block to the end of a patch file, keeping one blank line between it and whatever
+    /// was there.
+    fn append_block(lines: &mut Vec<String>, block: Vec<String>) {
+        if !lines.is_empty() && !lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.extend(block);
+    }
+
+    /// The DSH user patch layer, plus whether a DSH install looks present. `$DSH_HOME` counts as
+    /// present on its own — the user pointed us at it; the default home must show `profiles/`, so
+    /// we never create `~/.dsh` for an app that is not installed. The user home is resolved the
+    /// way the rest of the crate inlines it (`statusline`, `setup`, `window_sub`): `HOME`, else
+    /// `USERPROFILE` on Windows. Note `crate::daemon::home_dir()` is *not* this — it is llmtrim's
+    /// own state dir (`$LLMTRIM_HOME`/`~/.llmtrim`).
+    fn dsh_patch_path() -> Result<(PathBuf, bool)> {
+        if let Some(home) = std::env::var_os("DSH_HOME").filter(|v| !v.is_empty()) {
+            let dir = PathBuf::from(home);
+            return Ok((dir.join("cordis.patch.yml"), true));
+        }
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .context("neither HOME nor USERPROFILE is set")?;
+        let dir = PathBuf::from(home).join(".dsh");
+        let installed = dir.join("profiles").is_dir();
+        Ok((dir.join("cordis.patch.yml"), installed))
+    }
+
+    /// Report that there is no DSH here: an error when the user named DSH (`--client dsh`), a
+    /// note when `--client all` merely tried it. Split out so both branches are testable without
+    /// reading the machine's real home.
+    fn dsh_absence(required: bool, path: &std::path::Path) -> Result<()> {
+        let msg = format!(
+            "No DeepSeek Harness install found at {} — nothing written (set DSH_HOME to point at one).",
+            path.display()
+        );
+        if required {
+            anyhow::bail!("{msg}");
+        }
+        println!("{msg}");
+        Ok(())
+    }
+
+    /// Register with DeepSeek Harness by writing its user patch layer. Idempotent; `--force`
+    /// rewrites a stale block. DSH hot-reloads both patch layers on the web profile, so the tools
+    /// appear without a DSH restart.
+    fn install_dsh(print: bool, force: bool, required: bool) -> Result<()> {
+        if print {
+            print!("{DSH_BLOCK}");
+            return Ok(());
+        }
+        let (path, installed) = dsh_patch_path()?;
+        if !installed {
+            return dsh_absence(required, &path);
+        }
+        match install_dsh_at(&path, force)? {
+            DshOutcome::AlreadyRegistered => println!(
+                "llmtrim is already registered with DeepSeek Harness ({}).",
+                path.display()
+            ),
+            DshOutcome::Written => println!(
+                "Registered llmtrim with DeepSeek Harness ({}). DSH hot-reloads the patch layer, so no restart is needed.",
+                path.display()
+            ),
+            DshOutcome::Rewritten => {
+                println!(
+                    "Rewrote the llmtrim entry in {} (`--force`).",
+                    path.display()
+                )
+            }
+            DshOutcome::Stale => anyhow::bail!(
+                "{} already has an llmtrim entry that differs; re-run with `--force` to rewrite it.",
+                path.display()
+            ),
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -801,6 +1058,202 @@ mod imp {
             let calls: Calls = Rc::default();
             let run = fake_runner(calls, vec![Ok(Some(false)), Ok(Some(false))]); // absent, add fails
             assert!(install_with(false, false, run).is_err());
+        }
+
+        #[test]
+        fn dsh_block_registers_the_bridge_over_stdio() {
+            // The markers are what lets a re-run recognize a hand-written block, so they are part
+            // of the contract, not decoration.
+            assert!(DSH_BLOCK.starts_with(DSH_BEGIN));
+            assert!(DSH_BLOCK.trim_end().ends_with(DSH_END));
+            assert!(DSH_BLOCK.contains("  - id: mcp-llmtrim\n"));
+            assert!(DSH_BLOCK.contains("    name: '@deepseek-ai/dsh-mcp-client'\n"));
+            assert!(DSH_BLOCK.contains("      serverName: llmtrim\n"));
+            assert!(DSH_BLOCK.contains("      transport: stdio\n"));
+            assert!(DSH_BLOCK.contains("      command: llmtrim\n"));
+            assert!(DSH_BLOCK.contains("        - mcp\n"));
+        }
+
+        fn state_of(content: &str) -> DshEntry {
+            dsh_entry(&split_patch(content).0).0
+        }
+
+        #[test]
+        fn dsh_entry_finds_only_insert_blocks() {
+            assert_eq!(state_of(""), DshEntry::Absent);
+            // A column-0 row is a dsh-mcp-toggle disable override, not a registration.
+            assert_eq!(
+                state_of("- id: mcp-llmtrim\n  disabled: true\n"),
+                DshEntry::Absent
+            );
+            assert_eq!(state_of(DSH_BLOCK), DshEntry::Current);
+            let stale = DSH_BLOCK.replace("command: llmtrim", "command: C:\\old\\llmtrim.exe");
+            assert_eq!(state_of(&stale), DshEntry::Stale);
+            // A file written with Windows line endings scans identically.
+            assert_eq!(
+                state_of(&DSH_BLOCK.replace('\n', "\r\n")),
+                DshEntry::Current
+            );
+        }
+
+        #[test]
+        fn dsh_entry_ignores_other_servers() {
+            let other = "\
+# --- playwright MCP server ---
+- insert:
+  - id: mcp-playwright
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: playwright
+      transport: stdio
+      command: npx
+      args:
+        - -y
+        - '@playwright/mcp'
+# --- end playwright MCP server ---
+";
+            assert_eq!(state_of(other), DshEntry::Absent);
+            // Ours after someone else's is still found, and the range points at ours.
+            let both = format!("{other}\n{DSH_BLOCK}");
+            let lines = split_patch(&both).0;
+            let (state, range) = dsh_entry(&lines);
+            assert_eq!(state, DshEntry::Current);
+            // `lines[range]` would be a slice, not the element: take the range's start.
+            assert_eq!(lines[range.expect("found").start].trim(), DSH_BEGIN);
+        }
+
+        /// A fresh patch path per test; the tag keeps the parallel test runner from sharing files.
+        fn temp_patch(tag: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("llmtrim-mcp-dsh-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            dir.join("cordis.patch.yml")
+        }
+
+        #[test]
+        fn dsh_install_appends_once_and_reruns_are_byte_identical() {
+            let path = temp_patch("idempotent");
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("first write"),
+                DshOutcome::Written
+            );
+            let first = std::fs::read(&path).expect("file exists");
+
+            // A second `- insert:` row for the same id would mount a second mcp-client fiber on a
+            // serverName that is reserved while one is live, so a re-run must not write at all.
+            assert_eq!(
+                install_dsh_at(&path, false).expect("re-run"),
+                DshOutcome::AlreadyRegistered
+            );
+            assert_eq!(std::fs::read(&path).expect("file exists"), first);
+            assert_eq!(
+                String::from_utf8(first)
+                    .unwrap()
+                    .matches("- id: mcp-llmtrim")
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn dsh_install_preserves_a_hand_written_entry() {
+            let path = temp_patch("handwritten");
+            let before = "\
+# --- llmtrim MCP server ---
+- insert:
+  - id: mcp-llmtrim
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: llmtrim
+      transport: stdio
+      command: llmtrim
+      args:
+        - mcp
+# --- end llmtrim MCP server ---
+
+- id: mcp-playwright
+  disabled: true
+";
+            std::fs::write(&path, before).expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("no-op"),
+                DshOutcome::AlreadyRegistered
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+        }
+
+        #[test]
+        fn dsh_install_refuses_a_stale_entry_without_force() {
+            let path = temp_patch("stale");
+            let stale = DSH_BLOCK.replace("command: llmtrim", "command: C:\\old\\llmtrim.exe");
+            std::fs::write(&path, &stale).expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("refused"),
+                DshOutcome::Stale
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), stale);
+        }
+
+        #[test]
+        fn dsh_install_force_rewrites_in_place() {
+            let path = temp_patch("force");
+            let stale = DSH_BLOCK.replace("command: llmtrim", "command: C:\\old\\llmtrim.exe");
+            std::fs::write(
+                &path,
+                format!("- id: keep-me\n  disabled: false\n\n{stale}"),
+            )
+            .expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, true).expect("rewrite"),
+                DshOutcome::Rewritten
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert_eq!(after.matches("- id: mcp-llmtrim").count(), 1);
+            assert!(after.contains("      command: llmtrim\n"));
+            assert!(!after.contains("C:\\old\\llmtrim.exe"));
+            assert!(
+                after.contains("- id: keep-me\n  disabled: false\n"),
+                "the user's other rows survive"
+            );
+        }
+
+        #[test]
+        fn dsh_install_keeps_crlf() {
+            let path = temp_patch("crlf");
+            std::fs::write(&path, "- id: keep-me\r\n  disabled: false\r\n").expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("write"),
+                DshOutcome::Written
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert!(after.contains("- id: keep-me\r\n"));
+            assert!(after.contains("      command: llmtrim\r\n"));
+            assert!(
+                !after.replace("\r\n", "").contains('\n'),
+                "no LF-only line slipped into a CRLF file"
+            );
+        }
+
+        #[test]
+        fn dsh_absence_is_fatal_only_when_the_client_was_named() {
+            // `--client dsh` asked for it by name, so a missing install must not look like success;
+            // `--client all` merely tried it, so it is a note.
+            let nowhere = std::path::Path::new("C:\\no\\such\\dsh\\cordis.patch.yml");
+            assert!(dsh_absence(true, nowhere).is_err());
+            assert!(dsh_absence(false, nowhere).is_ok());
+        }
+
+        #[test]
+        fn dsh_print_mode_needs_no_install_and_writes_nothing() {
+            // `--print` returns before any path is resolved, so it is usable on a machine with no
+            // DSH at all — and `--client dsh --print` on this host must not touch the real home.
+            install_dsh(true, false, true).expect("print mode");
         }
 
         #[test]
