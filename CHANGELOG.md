@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-09-16
+
 ### Fixed
 
 - **DeepSeek dollars follow the published list again.** `deepseek-flash` replaced
@@ -1783,7 +1785,8 @@ bill, never a broken call.
   (6 targets with SLSA build provenance), CI on Linux/macOS/Windows with secret
   scanning, license compliance, and MSRV gates.
 
-[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.6...HEAD
+[Unreleased]: https://github.com/fkiene/llmtrim/compare/v0.13.7...HEAD
+[0.13.7]: https://github.com/fkiene/llmtrim/compare/v0.13.6...v0.13.7
 [0.13.6]: https://github.com/fkiene/llmtrim/compare/v0.13.5...v0.13.6
 [0.13.5]: https://github.com/fkiene/llmtrim/compare/v0.13.4...v0.13.5
 [0.13.4]: https://github.com/fkiene/llmtrim/compare/v0.13.3...v0.13.4
