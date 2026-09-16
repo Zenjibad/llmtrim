@@ -215,6 +215,35 @@ fn dsh_node_entry(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
 
 /// Rewrite a `wrap` invocation into the real (program, args) to launch.
 ///
+/// Quote one token for a `cmd.exe` command line. `cmd` parses a *command line*, not an
+/// argv array, so Rust's MSVCRT quoting (what `Command::args` applies) is wrong here: we
+/// quote each token ourselves and hand the whole line over with `raw_arg`. Interior quotes
+/// double, which is how `cmd` escapes them inside a quoted token. `%VAR%`/`!VAR!` still
+/// expand — that is what the shell does with the same argument, so it is behaviour, not a
+/// hole.
+fn cmd_escape(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for ch in arg.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// The `/c` tail for a `.cmd`/`.bat` shim: the shim path and every forwarded arg escaped.
+fn cmd_line(shim: &Path, args: &[String]) -> String {
+    let mut line = cmd_escape(&shim.to_string_lossy());
+    for a in args {
+        line.push(' ');
+        line.push_str(&cmd_escape(a));
+    }
+    line
+}
+
 /// Only Windows `dsh` is special: npm ships `dsh` as `.cmd`/`.ps1` shims that Rust's
 /// `Command` cannot exec directly, so we resolve the shim's directory on PATH and
 /// launch `node <shimDir>\node_modules\@deepseek-ai\dsh\lib\bin.js`. Every other
@@ -292,6 +321,21 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    use std::path::Path;
+
+    #[test]
+    fn cmd_escape_quotes_and_doubles_interior_quotes() {
+        assert_eq!(cmd_escape("plain"), "\"plain\"");
+        assert_eq!(cmd_escape("has space"), "\"has space\"");
+        assert_eq!(cmd_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn cmd_line_quotes_shim_and_every_arg() {
+        let line = cmd_line(Path::new("C:\\npm\\dsh.cmd"), &s(&["web", "a b"]));
+        assert_eq!(line, "\"C:\\npm\\dsh.cmd\" \"web\" \"a b\"");
     }
 
     #[test]
