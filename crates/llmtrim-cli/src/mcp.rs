@@ -543,6 +543,10 @@ mod imp {
     const DSH_BEGIN: &str = "# --- llmtrim MCP server ---";
     const DSH_END: &str = "# --- end llmtrim MCP server ---";
 
+    /// The row id we register under. The block text spells it literally; this is for the finder and
+    /// the duplicate guard, which must recognize every spelling of the id a hand edit can produce.
+    const ROW_ID: &str = "mcp-llmtrim";
+
     /// The patch block that registers llmtrim with DSH: a loader row mounting the bundled
     /// `@deepseek-ai/dsh-mcp-client` bridge, which re-exposes the tools as
     /// `mcp__llmtrim__llmtrim_compress`, `…_compress_text` and `…_stats`. `command: llmtrim` is
@@ -571,6 +575,11 @@ mod imp {
         Current,
         /// One does, but it launches something else (a stale absolute path, another binary).
         Stale,
+        /// Our row is in a shape this build must not rewrite: an `- insert:` list holding more
+        /// than one entry, or more than one block carrying our id. The message names what to fix.
+        /// Both are refused with or without `--force`: rewriting either would drop a sibling
+        /// registration or leave the duplicate that fails DSH's boot.
+        Refuse(String),
     }
 
     /// Split a patch file into lines without their terminators, and report whether it used
@@ -588,13 +597,70 @@ mod imp {
         (lines, crlf)
     }
 
-    /// Find the llmtrim insert block: a column-0 `- insert:` whose nested row is
-    /// `- id: mcp-llmtrim`, running to the closing marker or the next top-level row. A column-0
-    /// `- id: mcp-llmtrim` is a patch override — the row a settings page or a hand edit uses to
-    /// enable or disable an entry — not a registration. Returns the block's line range (BEGIN
-    /// marker included) so the caller rewrites exactly what it found. Pure.
+    /// The row id on a line, tolerating the spellings a hand edit or another writer produces: an
+    /// optional list marker, a quoted or spaced key (`id`, `"id"`, `id :`), quotes around the
+    /// value, and a flow mapping (`{id: mcp-llmtrim, …}`). Returns `None` for any other key, so
+    /// `identifier:` or a `config:` line cannot be mistaken for a row id.
+    fn row_id(line: &str) -> Option<String> {
+        let rest = line
+            .trim()
+            .trim_start_matches("- ")
+            .trim_start_matches('{')
+            .trim();
+        let (key, value) = rest.split_once(':')?;
+        if key.trim().trim_matches(['\'', '"']) != "id" {
+            return None;
+        }
+        let value = value.split(',').next().unwrap_or(value).trim();
+        let value = value.trim_matches(['\'', '"']).trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
+
+    /// Does this line mention the given row id, in a block row or inside a flow mapping?
+    fn line_mentions_id(line: &str, want: &str) -> bool {
+        if row_id(line).as_deref() == Some(want) {
+            return true;
+        }
+        line.match_indices('{')
+            .any(|(i, _)| row_id(&line[i + 1..]).as_deref() == Some(want))
+    }
+
+    /// How many entries the block's `insert:` list holds. Entries are list items at the indentation
+    /// of our own row, so a deeper `- ` line — an `args:` item — is not one. More than one means we
+    /// do not solely own the list: rewriting it would delete a sibling registration.
+    fn insert_entries(block: &[String]) -> usize {
+        let mut indent = None;
+        for line in block {
+            if row_id(line).as_deref() == Some(ROW_ID) {
+                indent = Some(line.len() - line.trim_start().len());
+                break;
+            }
+        }
+        let Some(indent) = indent else {
+            return 0;
+        };
+        block
+            .iter()
+            .filter(|l| {
+                l.len() - l.trim_start().len() == indent
+                    && (l.trim_start().starts_with("- ") || l.trim() == "-")
+            })
+            .count()
+    }
+
+    /// Find our insert block: a column-0 `- insert:` whose list holds a row with our id, running to
+    /// the closing marker or the first non-indented line after it. A column-0 `- id` row on its own
+    /// is a patch override — the row a settings page or a hand edit uses to enable or disable an
+    /// entry — not a registration. Returns the block's line range (BEGIN marker included) so the
+    /// caller rewrites exactly what it found, or [`DshEntry::Refuse`] when rewriting is unsafe.
+    /// Pure.
     fn dsh_entry(lines: &[String]) -> (DshEntry, Option<std::ops::Range<usize>>) {
         let mut i = 0;
+        let mut hits: Vec<(usize, usize, usize)> = Vec::new();
         while i < lines.len() {
             if lines[i] != "- insert:" {
                 i += 1;
@@ -602,55 +668,85 @@ mod imp {
             }
             let mut end = i + 1;
             while end < lines.len() {
-                if lines[end].trim() == DSH_END {
+                let line = &lines[end];
+                if line.trim() == DSH_END {
                     end += 1;
                     break;
                 }
-                if lines[end].starts_with("- ") || lines[end] == "-" {
+                // Empty and indented lines are ours to examine; the first non-indented non-empty
+                // line that is not our END marker — another row, or a comment — starts what comes
+                // next, so the range stops before it and a rewrite can never swallow it.
+                if line.len() == line.trim_start().len() && !line.trim().is_empty() {
                     break;
                 }
                 end += 1;
             }
-            let block = &lines[i..end];
-            if block.iter().any(|l| l.trim() == "- id: mcp-llmtrim") {
-                let state = if launches_llmtrim(block) {
-                    DshEntry::Current
-                } else {
-                    DshEntry::Stale
-                };
+            if lines[i..end].iter().any(|l| line_mentions_id(l, ROW_ID)) {
                 let start = if i > 0 && lines[i - 1].trim() == DSH_BEGIN {
                     i - 1
                 } else {
                     i
                 };
-                return (state, Some(start..end));
+                hits.push((i, start, end));
             }
             i = end;
         }
-        (DshEntry::Absent, None)
+
+        if hits.is_empty() {
+            return (DshEntry::Absent, None);
+        }
+        if hits.len() > 1 {
+            let numbered = hits
+                .iter()
+                .map(|(insert, _, _)| (*insert + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return (
+                DshEntry::Refuse(format!(
+                    "{} `- insert:` blocks carry `{ROW_ID}` (lines {numbered}); delete one by hand \
+                     and re-run — `--force` does not rewrite this, because two rows for one id fail \
+                     at DSH boot.",
+                    hits.len()
+                )),
+                None,
+            );
+        }
+        let (insert, start, end) = hits[0];
+        if insert_entries(&lines[insert..end]) > 1 {
+            return (
+                DshEntry::Refuse(format!(
+                    "the `- insert:` list at line {} holds more than one entry, so llmtrim does not \
+                     solely own it; rewriting it would drop the other registrations. Move our row \
+                     into its own `- insert:` list by hand and re-run — `--force` does not rewrite \
+                     this.",
+                    insert + 1
+                )),
+                None,
+            );
+        }
+        let state = if launches_llmtrim(&lines[insert..end]) {
+            DshEntry::Current
+        } else {
+            DshEntry::Stale
+        };
+        (state, Some(start..end))
     }
 
-    /// Does the file mention our row id in a shape [`dsh_entry`] does not understand? It only
-    /// reads our own block form, so a group-nested `insert:` or a flow-style `- insert: [{…}]`
-    /// would look absent and get a duplicate appended. A top-level `- id: mcp-llmtrim` toggle row
-    /// is fine and deliberately not matched here: that is the enable/disable override a user's
-    /// settings page writes, and appending the registration next to it is correct.
+    /// Does the file mention our row id in a shape [`dsh_entry`] does not claim? It reads only
+    /// column-0 `- insert:` blocks, so a group-nested `insert:` or a flow-style `- insert: [{…}]`
+    /// would look absent and get a duplicate appended — and a second row for one id fails at DSH
+    /// boot. A top-level override row (`- id: …` or `- {id: …, disabled: …}`), which a settings page
+    /// or a hand edit writes to enable or disable an entry, is not a registration and is
+    /// deliberately not matched: appending beside it is correct. Commented lines are not part of
+    /// the file.
     fn has_unparsed_llmtrim_row(lines: &[String]) -> bool {
         lines.iter().any(|l| {
-            let trimmed = l.trim();
-            let indented = l.len() != l.trim_start().len();
-            if indented && trimmed == "- id: mcp-llmtrim" {
-                return true;
+            if l.trim().starts_with('#') || !line_mentions_id(l, ROW_ID) {
+                return false;
             }
-            // A flow-style row on one line: `- insert: [{id: mcp-llmtrim, …}]`. Two things that
-            // look like one are not: a commented-out row is not part of the file, and a `disabled:`
-            // override *without* an `insert:` is the same enable/disable row the toggle branch
-            // above already ignores. The `insert:` test matters — a registration may itself carry
-            // `disabled: false` (which still mounts it), and refusing that is the whole point.
-            trimmed.contains('{')
-                && trimmed.contains("id: mcp-llmtrim")
-                && !trimmed.starts_with('#')
-                && !(trimmed.contains("disabled:") && !trimmed.contains("insert:"))
+            let indented = l.len() != l.trim_start().len();
+            let override_row = !indented && row_id(l).is_some();
+            !override_row
         })
     }
 
@@ -706,7 +802,8 @@ mod imp {
     /// point at a temp file. A current entry is never written back — the file stays
     /// byte-identical — because a second `- insert:` row for the same id mounts a second
     /// mcp-client fiber on a `serverName` that is reserved while one is live. Only the block we
-    /// found is replaced; every other byte of the user's file is preserved.
+    /// found is replaced; every other byte of the user's file is preserved. A shape we cannot
+    /// safely rewrite is refused before anything is written.
     fn install_dsh_at(path: &std::path::Path, force: bool) -> Result<DshOutcome> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
@@ -745,6 +842,7 @@ mod imp {
                 append_block(&mut lines, block);
                 DshOutcome::Written
             }
+            DshEntry::Refuse(reason) => anyhow::bail!("{}: {reason}", path.display()),
         };
 
         if matches!(outcome, DshOutcome::AlreadyRegistered | DshOutcome::Stale) {
@@ -1235,6 +1333,49 @@ mod imp {
             assert_eq!(state_of(&foreign), DshEntry::Stale);
         }
 
+        #[test]
+        fn dsh_guard_classifies_every_row_spelling() {
+            // A guard false positive blocks an append that is correct; a false negative appends a
+            // second row for one id, which fails at DSH boot. Both sides are pinned here.
+            let guard = |content: &str| has_unparsed_llmtrim_row(&split_patch(content).0);
+            // Not registrations: the override rows a settings page or a hand edit writes, and a
+            // commented-out row.
+            assert!(!guard("- id: mcp-llmtrim\n  disabled: true\n"));
+            assert!(!guard("- {id: mcp-llmtrim, disabled: true}\n"));
+            assert!(!guard("# - insert: [{id: mcp-llmtrim, disabled: false}]\n"));
+            assert!(!guard("- id: mcp-playwright\n  disabled: true\n"));
+            // `identifier:` is not the `id` key.
+            assert!(!guard("identifier: mcp-llmtrim\n"));
+            // Registrations `dsh_entry` does not claim, in every spelling that parses to a row:
+            // refusing to append is the only safe answer.
+            assert!(guard("- insert:\n    - id: mcp-llmtrim\n"));
+            assert!(guard(
+                "- insert:\n    - {id: mcp-llmtrim, config: {serverName: llmtrim}, disabled: false}\n"
+            ));
+            assert!(guard("- insert:\n    - id: \"mcp-llmtrim\"\n"));
+            assert!(guard("- insert:\n    - id : mcp-llmtrim\n"));
+            assert!(guard("- insert: [{id: mcp-llmtrim, config: {serverName: llmtrim}}]\n"));
+        }
+
+        #[test]
+        fn dsh_entry_accepts_a_quoted_or_spaced_row_id() {
+            // A quoted value or a space before the colon is the same row id, so a canonical block
+            // spelled that way must read as already registered rather than as absent.
+            for spelling in ["    - id: \"mcp-llmtrim\"\n", "    - id : mcp-llmtrim\n"] {
+                let content = format!(
+                    "- insert:\n{spelling}      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: llmtrim\n        command: llmtrim\n        args:\n          - mcp\n"
+                );
+                assert_eq!(state_of(&content), DshEntry::Current, "{content}");
+                let path = temp_patch("quoted-id");
+                std::fs::write(&path, &content).expect("seed");
+                assert_eq!(
+                    install_dsh_at(&path, false).expect("no-op"),
+                    DshOutcome::AlreadyRegistered
+                );
+                assert_eq!(std::fs::read_to_string(&path).expect("read"), content);
+            }
+        }
+
         /// A fresh temp directory per test; the tag keeps the parallel test runner from sharing files.
         fn temp_dir_for(tag: &str) -> std::path::PathBuf {
             let dir =
@@ -1421,6 +1562,121 @@ mod imp {
             // The id now appears twice: the user's flow toggle, and our appended nested row. The
             // substring is `id: …`, not `- id: …`, because a flow row is spelled `- {id: …}`.
             assert_eq!(flow_after.matches("id: mcp-llmtrim").count(), 2);
+        }
+
+        #[test]
+        fn dsh_install_refuses_an_insert_list_it_does_not_solely_own() {
+            // One `- insert:` list holding two entries: `--force` used to replace the whole list,
+            // deleting the sibling registration. Order must not matter, and neither force mode may
+            // touch the file.
+            let ours = "\
+  - id: mcp-llmtrim
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: llmtrim
+      command: llmtrim
+      args:
+        - mcp
+";
+            let theirs = "\
+  - id: mcp-playwright
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: playwright
+      command: npx
+";
+            for order in ["playwright-first", "llmtrim-first"] {
+                let path = temp_patch(order);
+                let list = if order == "playwright-first" {
+                    format!("- insert:\n{theirs}{ours}")
+                } else {
+                    format!("- insert:\n{ours}{theirs}")
+                };
+                std::fs::write(&path, &list).expect("seed");
+
+                for force in [false, true] {
+                    let err = install_dsh_at(&path, force).expect_err("must refuse");
+                    assert!(
+                        err.to_string().contains("more than one entry"),
+                        "reason names the list: {err}"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&path).expect("read"),
+                        list,
+                        "a refused rewrite must leave the file byte-identical"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn dsh_install_refuses_two_blocks_carrying_our_id() {
+            // The state this tool exists to prevent must not be reported as success: name both.
+            let path = temp_patch("two-blocks");
+            let stale = DSH_BLOCK.replace("command: llmtrim", "command: C:\\old\\llmtrim.exe");
+            let content = format!("{stale}\n{DSH_BLOCK}");
+            std::fs::write(&path, &content).expect("seed");
+
+            for force in [false, true] {
+                let err = install_dsh_at(&path, force).expect_err("must refuse");
+                let message = err.to_string();
+                assert!(message.contains("2 `- insert:` blocks"), "{message}");
+                assert!(message.contains("lines 2, 14"), "names both blocks: {message}");
+                assert_eq!(std::fs::read_to_string(&path).expect("read"), content);
+            }
+        }
+
+        #[test]
+        fn dsh_install_rewrites_only_our_row_and_keeps_a_trailing_comment() {
+            // A marker-less registration used to take everything up to the next top-level row into
+            // its range, so `--force` deleted the user's trailing notes.
+            let path = temp_patch("markerless");
+            let content = "\
+- insert:
+  - id: mcp-llmtrim
+    name: '@deepseek-ai/dsh-mcp-client'
+    config:
+      serverName: llmtrim
+      command: C:\\old\\llmtrim.exe
+      args:
+        - mcp
+# my own notes - do not delete
+";
+            std::fs::write(&path, content).expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, true).expect("rewrite"),
+                DshOutcome::Rewritten
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert!(after.contains("# my own notes - do not delete"), "{after}");
+            assert!(after.contains("      command: llmtrim\n"), "{after}");
+            assert_eq!(after.matches("- id: mcp-llmtrim").count(), 1);
+        }
+
+        #[test]
+        fn dsh_install_claims_but_does_not_append_beside_a_flow_row() {
+            // A row spelled as an indented flow mapping is ours: a plain install reports it as
+            // stale rather than duplicating it, and `--force` rewrites just that row.
+            let path = temp_patch("flow-row");
+            let content = "\
+- insert:
+  - {id: mcp-llmtrim, name: '@deepseek-ai/dsh-mcp-client', config: {serverName: llmtrim, command: C:\\old\\llmtrim.exe, args: [mcp]}}
+";
+            std::fs::write(&path, content).expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("stale"),
+                DshOutcome::Stale
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), content);
+            assert_eq!(
+                install_dsh_at(&path, true).expect("rewrite"),
+                DshOutcome::Rewritten
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert_eq!(after.matches("mcp-llmtrim").count(), 1);
+            assert!(after.contains("      command: llmtrim\n"), "{after}");
         }
 
         #[test]
