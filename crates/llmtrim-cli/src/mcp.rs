@@ -469,22 +469,39 @@ mod imp {
     /// CLI, so its user patch layer is written directly. Idempotent either way, with `--force` to
     /// reinstall a stale entry. `--print` skips every write.
     pub fn install_for_client(print: bool, force: bool, client: McpClient) -> Result<()> {
+        install_for_client_with(print, force, client, install_claude, install_dsh)
+    }
+
+    /// [`install_for_client`] with both client halves injected, so the `All` branch's ordering and
+    /// reporting can be tested without touching a real client's config.
+    fn install_for_client_with(
+        print: bool,
+        force: bool,
+        client: McpClient,
+        claude: impl Fn(bool, bool) -> Result<()>,
+        dsh: impl Fn(bool, bool, bool) -> Result<()>,
+    ) -> Result<()> {
         match client {
-            McpClient::Claude => install_claude(print, force),
-            McpClient::Dsh => install_dsh(print, force, true),
+            McpClient::Claude => claude(print, force),
+            McpClient::Dsh => dsh(print, force, true),
             McpClient::All => {
                 if print {
                     println!("# Claude Code");
-                    install_claude(true, force)?;
+                    claude(true, force)?;
                     println!("\n# DeepSeek Harness");
-                    return install_dsh(true, force, false);
+                    return dsh(true, force, false);
                 }
-                // Bind both before combining: `Result::and` takes its argument eagerly, so the
-                // DSH half runs even when the Claude half fails. Written longhand because a
-                // refactor to `and_then` would silently skip it.
-                let claude = install_claude(false, force);
-                let dsh = install_dsh(false, force, false);
-                claude.and(dsh)
+                // Bind both before combining: `Result::and` takes its argument eagerly, so the DSH
+                // half runs even when the Claude half fails. Written longhand because a refactor to
+                // `and_then` would silently skip it.
+                let claude_result = claude(false, force);
+                let dsh_result = dsh(false, force, false);
+                if claude_result.is_err() && dsh_result.is_ok() {
+                    eprintln!(
+                        "llmtrim was registered with DeepSeek Harness; the Claude Code half failed."
+                    );
+                }
+                claude_result.and(dsh_result)
             }
         }
     }
@@ -855,27 +872,54 @@ mod imp {
         let eol = if crlf { "\r\n" } else { "\n" };
         let mut text = lines.join(eol);
         text.push_str(eol);
-        let file_name = path
+        // Stage beside the real file: `fs::rename` over a symlinked patch layer would replace the
+        // link itself and detach a dotfile-managed file from its manager. The messages keep naming
+        // the user-facing path.
+        let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let file_name = target
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("cordis.patch.yml");
-        let tmp = path.with_file_name(format!("{file_name}.llmtrim-tmp"));
-        std::fs::write(&tmp, text).with_context(|| format!("failed to write {}", tmp.display()))?;
-        // Keep the original's permissions: a patch layer can carry tokens, and a fresh temp file
-        // would otherwise widen them. Absent file (first install) has none to copy.
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions())
-                .with_context(|| format!("failed to set permissions on {}", tmp.display()))?;
+        let tmp = target.with_file_name(format!("{file_name}.llmtrim-tmp"));
+        let staged = || -> Result<()> {
+            #[cfg(unix)]
+            {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+                // `mode` applies only when the file is *created*, and a stale temp from a killed
+                // run could be wider, so drop it first and let 0600 take effect.
+                let _ = std::fs::remove_file(&tmp);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .and_then(|mut f| f.write_all(text.as_bytes()))
+                    .with_context(|| format!("failed to write {}", tmp.display()))?;
+            }
+            #[cfg(not(unix))]
+            std::fs::write(&tmp, &text)
+                .with_context(|| format!("failed to write {}", tmp.display()))?;
+            // Keep the original's permissions: a patch layer can carry tokens, and the temp file
+            // would otherwise widen them. An absent file (first install) has none to copy.
+            if let Ok(meta) = std::fs::metadata(&target) {
+                std::fs::set_permissions(&tmp, meta.permissions())
+                    .with_context(|| format!("failed to set permissions on {}", tmp.display()))?;
+            }
+            // The old content survives until this rename succeeds, so a crash leaves the user's
+            // patch file intact.
+            std::fs::rename(&tmp, &target)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+            Ok(())
+        };
+        if let Err(e) = staged() {
+            // Never leave a `.llmtrim-tmp` beside the user's patch layer.
+            #[cfg(windows)]
+            clear_read_only(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        // Rename over the original: the old content survives until this succeeds, so a crash
-        // leaves the user's patch file intact (worst case a stale `.llmtrim-tmp` beside it).
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!(
-                "failed to replace {} (the new content is at {})",
-                path.display(),
-                tmp.display()
-            )
-        })?;
         Ok(outcome)
     }
 
@@ -888,19 +932,35 @@ mod imp {
         lines.extend(block);
     }
 
+    /// Clear the Windows read-only attribute so a stale temp file can be unlinked. Windows-only:
+    /// here `set_readonly(false)` clears `FILE_ATTRIBUTE_READONLY`, which is exactly what makes a
+    /// read-only temp removable, and the lint's Unix concern ("world writable") cannot arise.
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn clear_read_only(path: &std::path::Path) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+
     /// The DSH user patch layer, plus whether a DSH install looks present. `$DSH_HOME` counts as
     /// present on its own — the user pointed us at it; the default home must show `profiles/`, so
-    /// we never create `~/.dsh` for an app that is not installed. The user home is resolved the
-    /// way the rest of the crate inlines it (`statusline`, `setup`, `window_sub`): `HOME`, else
-    /// `USERPROFILE` on Windows. Note `crate::daemon::home_dir()` is *not* this — it is llmtrim's
-    /// own state dir (`$LLMTRIM_HOME`/`~/.llmtrim`).
+    /// we never create `~/.dsh` for an app that is not installed. The home is resolved the way DSH
+    /// itself resolves it: `USERPROFILE` first on Windows, where a Git Bash `HOME=/c/Users/…` would
+    /// send us to `C:\c\Users\…`, and `HOME` first elsewhere. Note `crate::daemon::home_dir()` is
+    /// *not* this — it is llmtrim's own state dir (`$LLMTRIM_HOME`/`~/.llmtrim`).
     fn dsh_patch_path() -> Result<(PathBuf, bool)> {
         if let Some(dir) = std::env::var_os("DSH_HOME").filter(|v| !v.is_empty()) {
             return Ok(dsh_patch_path_from_dsh_home(&dir));
         }
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .context("neither HOME nor USERPROFILE is set")?;
+        let home = if cfg!(windows) {
+            std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
+        } else {
+            std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+        }
+        .context("neither HOME nor USERPROFILE is set")?;
         Ok(dsh_patch_path_from_home(std::path::Path::new(&home)))
     }
 
@@ -1354,7 +1414,9 @@ mod imp {
             ));
             assert!(guard("- insert:\n    - id: \"mcp-llmtrim\"\n"));
             assert!(guard("- insert:\n    - id : mcp-llmtrim\n"));
-            assert!(guard("- insert: [{id: mcp-llmtrim, config: {serverName: llmtrim}}]\n"));
+            assert!(guard(
+                "- insert: [{id: mcp-llmtrim, config: {serverName: llmtrim}}]\n"
+            ));
         }
 
         #[test]
@@ -1569,22 +1631,13 @@ mod imp {
             // One `- insert:` list holding two entries: `--force` used to replace the whole list,
             // deleting the sibling registration. Order must not matter, and neither force mode may
             // touch the file.
-            let ours = "\
-  - id: mcp-llmtrim
-    name: '@deepseek-ai/dsh-mcp-client'
-    config:
-      serverName: llmtrim
-      command: llmtrim
-      args:
-        - mcp
-";
-            let theirs = "\
-  - id: mcp-playwright
-    name: '@deepseek-ai/dsh-mcp-client'
-    config:
-      serverName: playwright
-      command: npx
-";
+            let ours = "  - id: mcp-llmtrim\n    name: '@deepseek-ai/dsh-mcp-client'\n    config:\n      serverName: llmtrim\n      command: llmtrim\n      args:\n        - mcp\n";
+            let theirs = "  - id: mcp-playwright\n    name: '@deepseek-ai/dsh-mcp-client'\n    config:\n      serverName: playwright\n      command: npx\n";
+            // Pin the fixture: a Rust `"\` continuation strips the next line's leading whitespace,
+            // which would move these rows to column 0, empty the insert list and turn this test
+            // into a no-op.
+            assert!(ours.starts_with("  - id: mcp-llmtrim"));
+            assert!(theirs.starts_with("  - id: mcp-playwright"));
             for order in ["playwright-first", "llmtrim-first"] {
                 let path = temp_patch(order);
                 let list = if order == "playwright-first" {
@@ -1621,7 +1674,10 @@ mod imp {
                 let err = install_dsh_at(&path, force).expect_err("must refuse");
                 let message = err.to_string();
                 assert!(message.contains("2 `- insert:` blocks"), "{message}");
-                assert!(message.contains("lines 2, 14"), "names both blocks: {message}");
+                assert!(
+                    message.contains("lines 2, 14"),
+                    "names both blocks: {message}"
+                );
                 assert_eq!(std::fs::read_to_string(&path).expect("read"), content);
             }
         }
@@ -1738,17 +1794,162 @@ mod imp {
         #[test]
         fn dsh_absence_is_fatal_only_when_the_client_was_named() {
             // `--client dsh` asked for it by name, so a missing install must not look like success;
-            // `--client all` merely tried it, so it is a note.
+            // `--client all` merely tried it, so it is a note. The message has to name the path, or
+            // the user cannot tell which home we looked in.
             let nowhere = std::path::Path::new("C:\\no\\such\\dsh\\cordis.patch.yml");
-            assert!(dsh_absence(true, nowhere).is_err());
+            let err = dsh_absence(true, nowhere).expect_err("a named client must be fatal");
+            let message = err.to_string();
+            assert!(
+                message.contains("No DeepSeek Harness install found"),
+                "{message}"
+            );
+            assert!(
+                message.contains("C:\\no\\such\\dsh\\cordis.patch.yml"),
+                "{message}"
+            );
             assert!(dsh_absence(false, nowhere).is_ok());
         }
 
         #[test]
-        fn dsh_print_mode_needs_no_dsh_install() {
+        fn dsh_print_mode_short_circuits_before_the_absence_check() {
             // `--print` returns before any path is resolved, so it is usable on a machine with no
             // DSH at all — and `--client dsh --print` on this host must not touch the real home.
-            install_dsh(true, false, true).expect("print mode");
+            // Asking with `required = true` is what makes this assert something: an absence branch
+            // that were reached would have to error, so `Ok` proves the print branch returned first.
+            assert!(install_dsh(true, false, true).is_ok());
+        }
+
+        #[test]
+        fn install_for_client_all_runs_both_halves() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let claude_calls = std::rc::Rc::clone(&calls);
+            let dsh_calls = std::rc::Rc::clone(&calls);
+            let claude = move |_print: bool, _force: bool| -> Result<()> {
+                claude_calls.borrow_mut().push("claude".to_string());
+                Ok(())
+            };
+            let dsh = move |_print: bool, _force: bool, required: bool| -> Result<()> {
+                dsh_calls
+                    .borrow_mut()
+                    .push(format!("dsh required={required}"));
+                Ok(())
+            };
+
+            install_for_client_with(false, false, McpClient::All, claude, dsh)
+                .expect("both halves");
+            assert_eq!(
+                *calls.borrow(),
+                vec!["claude".to_string(), "dsh required=false".to_string()]
+            );
+        }
+
+        #[test]
+        fn install_for_client_all_print_forwards_print_to_both_halves() {
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let claude_seen = std::rc::Rc::clone(&seen);
+            let dsh_seen = std::rc::Rc::clone(&seen);
+            let claude = move |print: bool, _force: bool| -> Result<()> {
+                claude_seen
+                    .borrow_mut()
+                    .push(format!("claude print={print}"));
+                Ok(())
+            };
+            let dsh = move |print: bool, _force: bool, required: bool| -> Result<()> {
+                dsh_seen
+                    .borrow_mut()
+                    .push(format!("dsh print={print} required={required}"));
+                Ok(())
+            };
+
+            install_for_client_with(true, false, McpClient::All, claude, dsh).expect("print");
+            assert_eq!(
+                *seen.borrow(),
+                vec![
+                    "claude print=true".to_string(),
+                    "dsh print=true required=false".to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn install_for_client_dsh_requires_an_install() {
+            // The DSH-only path must demand an install and must not run the Claude half at all.
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let dsh_seen = std::rc::Rc::clone(&seen);
+            let claude = |_print: bool, _force: bool| -> Result<()> {
+                panic!("the Claude half must not run for --client dsh")
+            };
+            let dsh = move |print: bool, force: bool, required: bool| -> Result<()> {
+                dsh_seen
+                    .borrow_mut()
+                    .push(format!("print={print} force={force} required={required}"));
+                Ok(())
+            };
+
+            install_for_client_with(false, true, McpClient::Dsh, claude, dsh).expect("dsh half");
+            assert_eq!(
+                *seen.borrow(),
+                vec!["print=false force=true required=true".to_string()]
+            );
+        }
+
+        #[test]
+        fn install_for_client_all_returns_the_first_error_and_still_runs_dsh() {
+            let dsh_ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let flag = std::rc::Rc::clone(&dsh_ran);
+            let claude =
+                |_print: bool, _force: bool| -> Result<()> { anyhow::bail!("claude broke") };
+            let dsh = move |_print: bool, _force: bool, _required: bool| -> Result<()> {
+                flag.set(true);
+                Ok(())
+            };
+
+            let err = install_for_client_with(false, false, McpClient::All, claude, dsh)
+                .expect_err("the Claude error is the one reported");
+            assert_eq!(err.to_string(), "claude broke");
+            assert!(
+                dsh_ran.get(),
+                "a failing Claude half must not skip the DSH half"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn dsh_install_keeps_the_patch_files_permissions() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = temp_patch("perms");
+            let _ = std::fs::remove_file(&path);
+            std::fs::write(&path, "- id: keep-me\n  disabled: false\n").expect("seed");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("write"),
+                DshOutcome::Written
+            );
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the write must not widen the patch layer");
+        }
+
+        #[test]
+        fn dsh_install_reports_a_failed_write_without_clobbering_anything() {
+            // Occupy the temp path with a directory: no platform will open a directory as the
+            // staged file, and the cleanup must not delete what it did not create.
+            let path = temp_patch("failed-write");
+            let _ = std::fs::remove_file(&path);
+            let tmp = path.with_file_name("cordis.patch.yml.llmtrim-tmp");
+            std::fs::create_dir_all(&tmp).expect("occupy the temp path");
+
+            let err = install_dsh_at(&path, false).expect_err("the write must fail");
+            assert!(err.to_string().contains("failed to write"), "{err}");
+            assert!(
+                tmp.is_dir(),
+                "the cleanup must not remove what it did not create"
+            );
+            assert!(!path.exists(), "nothing may be written at the patch layer");
         }
 
         #[test]
