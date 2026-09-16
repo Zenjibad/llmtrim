@@ -8,13 +8,24 @@
 //! Like [`crate::serve`], the real implementation is feature-gated (`mcp`); a build
 //! without it keeps the `mcp` subcommand but bails with a clear rebuild hint.
 
+/// Which MCP client `mcp install` registers with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpClient {
+    /// Claude Code, through its own `claude mcp add` CLI.
+    Claude,
+    /// DeepSeek Harness, through its user patch layer (`$DSH_HOME/cordis.patch.yml`).
+    Dsh,
+    /// Every client llmtrim knows how to register with.
+    All,
+}
+
 #[cfg(not(feature = "mcp"))]
 pub fn run() -> anyhow::Result<()> {
     anyhow::bail!("this build has no MCP server; rebuild with `--features mcp`")
 }
 
 #[cfg(not(feature = "mcp"))]
-pub fn install(_print: bool, _force: bool) -> anyhow::Result<()> {
+pub fn install(_print: bool, _force: bool, _client: McpClient) -> anyhow::Result<()> {
     anyhow::bail!("this build has no MCP server; rebuild with `--features mcp`")
 }
 
@@ -41,6 +52,7 @@ mod imp {
     use std::path::PathBuf;
     use std::str::FromStr;
 
+    use super::McpClient;
     use anyhow::{Context, Result};
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResult, ContentBlock};
@@ -431,12 +443,19 @@ mod imp {
         }
     }
 
-    /// Register the llmtrim MCP server with the user's client. Today that means Claude Code
-    /// via its own `claude mcp add` CLI (which owns the config file, so we don't hand-edit
-    /// it); idempotent, with `--force` to reinstall a stale entry. Any other client is served
-    /// the config block to paste. `--print` skips all writes and just emits that block.
-    pub fn install(print: bool, force: bool) -> Result<()> {
+    /// Register the llmtrim MCP server with Claude Code via its own `claude mcp add` CLI (which
+    /// owns the config file, so we don't hand-edit it); idempotent, with `--force` to reinstall a
+    /// stale entry. Any other client is served the config block to paste. `--print` skips all
+    /// writes and just emits that block.
+    fn install_claude(print: bool, force: bool) -> Result<()> {
         install_with(print, force, run_claude)
+    }
+
+    /// Register with the requested client(s). DSH is added in a later task.
+    pub fn install(print: bool, force: bool, client: McpClient) -> Result<()> {
+        match client {
+            McpClient::Claude | McpClient::Dsh | McpClient::All => install_claude(print, force),
+        }
     }
 
     /// `install` with the `claude` runner injected (see [`run_claude`]).
