@@ -639,8 +639,18 @@ mod imp {
         lines.iter().any(|l| {
             let trimmed = l.trim();
             let indented = l.len() != l.trim_start().len();
-            (indented && trimmed == "- id: mcp-llmtrim")
-                || (trimmed.contains('{') && trimmed.contains("id: mcp-llmtrim"))
+            if indented && trimmed == "- id: mcp-llmtrim" {
+                return true;
+            }
+            // A flow-style row on one line: `- insert: [{id: mcp-llmtrim, …}]`. Two things that
+            // look like one are not: a commented-out row is not part of the file, and a `disabled:`
+            // override *without* an `insert:` is the same enable/disable row the toggle branch
+            // above already ignores. The `insert:` test matters — a registration may itself carry
+            // `disabled: false` (which still mounts it), and refusing that is the whole point.
+            trimmed.contains('{')
+                && trimmed.contains("id: mcp-llmtrim")
+                && !trimmed.starts_with('#')
+                && !(trimmed.contains("disabled:") && !trimmed.contains("insert:"))
         })
     }
 
@@ -753,6 +763,12 @@ mod imp {
             .unwrap_or("cordis.patch.yml");
         let tmp = path.with_file_name(format!("{file_name}.llmtrim-tmp"));
         std::fs::write(&tmp, text).with_context(|| format!("failed to write {}", tmp.display()))?;
+        // Keep the original's permissions: a patch layer can carry tokens, and a fresh temp file
+        // would otherwise widen them. Absent file (first install) has none to copy.
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, meta.permissions())
+                .with_context(|| format!("failed to set permissions on {}", tmp.display()))?;
+        }
         // Rename over the original: the old content survives until this succeeds, so a crash
         // leaves the user's patch file intact (worst case a stale `.llmtrim-tmp` beside it).
         std::fs::rename(&tmp, path).with_context(|| {
@@ -1204,6 +1220,10 @@ mod imp {
             let quoted = DSH_BLOCK
                 .replace("command: llmtrim", "command: 'llmtrim'")
                 .replace("      args:\n        - mcp\n", "      args: [mcp]\n");
+            // Pin the fixture: if that second replace ever misses, the block-form `- mcp` line keeps
+            // the assertion below green and the flow form goes untested.
+            assert!(quoted.contains("args: [mcp]"));
+            assert!(!quoted.contains("- mcp"));
             assert_eq!(state_of(&quoted), DshEntry::Current);
         }
 
@@ -1357,6 +1377,50 @@ mod imp {
             assert!(install_dsh_at(&path, false).is_err());
             assert!(install_dsh_at(&path, true).is_err());
             assert_eq!(std::fs::read_to_string(&path).expect("read"), grouped);
+
+            // Flow style, carrying `disabled: false`: still a registration (that value mounts it), so
+            // it must be refused like the nested form above.
+            let flow = "\
+- insert: [{id: mcp-llmtrim, name: '@deepseek-ai/dsh-mcp-client', config: {serverName: llmtrim, command: llmtrim, args: [mcp]}, disabled: false}]
+";
+            let flow_path = temp_patch("unparsed-flow");
+            std::fs::write(&flow_path, flow).expect("seed");
+            assert!(install_dsh_at(&flow_path, false).is_err());
+            assert_eq!(std::fs::read_to_string(&flow_path).expect("read"), flow);
+        }
+
+        #[test]
+        fn dsh_install_appends_beside_a_toggle_row() {
+            // The `disabled:` row a user's settings page writes is not a registration, so ours is
+            // still appended next to it — the guard's deliberate carve-out.
+            let path = temp_patch("toggle-row");
+            std::fs::write(&path, "- id: mcp-llmtrim\n  disabled: true\n").expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("write"),
+                DshOutcome::Written
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert!(after.starts_with("- id: mcp-llmtrim\n  disabled: true\n"));
+            assert_eq!(after.matches("- id: mcp-llmtrim").count(), 2);
+            assert!(
+                after.contains("  - id: mcp-llmtrim\n"),
+                "the block's nested row was appended"
+            );
+
+            // A flow toggle override without an `insert:` is not a registration either, so the
+            // carve-out still applies and the append goes ahead.
+            let flow_path = temp_patch("toggle-row-flow");
+            std::fs::write(&flow_path, "- {id: mcp-llmtrim, disabled: true}\n").expect("seed");
+            assert_eq!(
+                install_dsh_at(&flow_path, false).expect("write"),
+                DshOutcome::Written
+            );
+            let flow_after = std::fs::read_to_string(&flow_path).expect("read");
+            assert!(flow_after.starts_with("- {id: mcp-llmtrim, disabled: true}\n"));
+            // The id now appears twice: the user's flow toggle, and our appended nested row. The
+            // substring is `id: …`, not `- id: …`, because a flow row is spelled `- {id: …}`.
+            assert_eq!(flow_after.matches("id: mcp-llmtrim").count(), 2);
         }
 
         #[test]
@@ -1393,6 +1457,9 @@ mod imp {
             // No `profiles/` directory: not a DSH install, so `--client dsh` refuses rather than
             // creating `~/.dsh` for an app that is not there.
             let home = temp_dir_for("path");
+            // A previous run in a reused pid could have left `profiles/` behind, which would make the
+            // "not installed" assertion below depend on run order.
+            let _ = std::fs::remove_dir_all(home.join(".dsh"));
             let (path, installed) = dsh_patch_path_from_home(&home);
             assert_eq!(path, home.join(".dsh").join("cordis.patch.yml"));
             assert!(!installed);
