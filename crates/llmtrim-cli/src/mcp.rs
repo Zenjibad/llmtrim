@@ -479,9 +479,12 @@ mod imp {
                     println!("\n# DeepSeek Harness");
                     return install_dsh(true, force, false);
                 }
-                // Both run; the first failure is reported, and a missing DSH never stops the
-                // Claude half (`install_dsh` is called with `required = false`).
-                install_claude(false, force).and(install_dsh(false, force, false))
+                // Bind both before combining: `Result::and` takes its argument eagerly, so the
+                // DSH half runs even when the Claude half fails. Written longhand because a
+                // refactor to `and_then` would silently skip it.
+                let claude = install_claude(false, force);
+                let dsh = install_dsh(false, force, false);
+                claude.and(dsh)
             }
         }
     }
@@ -627,14 +630,53 @@ mod imp {
         (DshEntry::Absent, None)
     }
 
-    /// Does an insert block launch `llmtrim mcp`? Only the two lines llmtrim owns are compared,
-    /// so extra keys the user added to the block do not make it stale.
+    /// Does the file mention our row id in a shape [`dsh_entry`] does not understand? It only
+    /// reads our own block form, so a group-nested `insert:` or a flow-style `- insert: [{…}]`
+    /// would look absent and get a duplicate appended. A top-level `- id: mcp-llmtrim` toggle row
+    /// is fine and deliberately not matched here: that is the enable/disable override a user's
+    /// settings page writes, and appending the registration next to it is correct.
+    fn has_unparsed_llmtrim_row(lines: &[String]) -> bool {
+        lines.iter().any(|l| {
+            let trimmed = l.trim();
+            let indented = l.len() != l.trim_start().len();
+            (indented && trimmed == "- id: mcp-llmtrim")
+                || (trimmed.contains('{') && trimmed.contains("id: mcp-llmtrim"))
+        })
+    }
+
+    /// Does an insert block register llmtrim the way we would? The file is user-editable, so the
+    /// same registration is spelled several ways — DSH's own profile layer writes quoted scalars
+    /// and flow-style arg lists. A command that names a path is deliberately NOT this
+    /// registration: we write the bare name so an upgrade cannot leave a stale absolute path, and
+    /// `--force` is what replaces one. A foreign `serverName` is not ours either, since the tools
+    /// would appear under a different namespace.
     fn launches_llmtrim(block: &[String]) -> bool {
-        let command = block
-            .iter()
-            .find_map(|l| l.trim().strip_prefix("command:"))
-            .map(str::trim);
-        command == Some("llmtrim") && block.iter().any(|l| l.trim() == "- mcp")
+        let value = |key: &str| -> Option<String> {
+            block
+                .iter()
+                .find_map(|l| l.trim().strip_prefix(key))
+                .map(|v| v.trim().trim_matches(['\'', '"']).trim().to_string())
+        };
+        let bare = |v: Option<String>| v.is_some_and(|s| s.eq_ignore_ascii_case("llmtrim"));
+        bare(value("command:")) && bare(value("serverName:")) && has_mcp_arg(block)
+    }
+
+    /// Is `mcp` in the block's argument list, in either the block form we write or the flow form
+    /// a hand-edited file may use (`args: [mcp]`, `args: ["mcp"]`)?
+    fn has_mcp_arg(block: &[String]) -> bool {
+        if block.iter().any(|l| l.trim() == "- mcp") {
+            return true;
+        }
+        block.iter().any(|l| {
+            l.trim()
+                .strip_prefix("args:")
+                .map(|v| v.trim().trim_matches(['[', ']']))
+                .is_some_and(|v| {
+                    v.trim()
+                        .trim_matches(['\'', '"'])
+                        .eq_ignore_ascii_case("mcp")
+                })
+        })
     }
 
     /// What [`install_dsh_at`] did, so the caller can report it.
@@ -682,6 +724,14 @@ mod imp {
                 }
             },
             DshEntry::Absent => {
+                if has_unparsed_llmtrim_row(&lines) {
+                    anyhow::bail!(
+                        "{} already mentions `mcp-llmtrim` in a shape this build does not parse; \
+                         refusing to add a second row for one server (duplicate rows fail at DSH \
+                         boot). Remove that row by hand, then re-run.",
+                        path.display()
+                    );
+                }
                 append_block(&mut lines, block);
                 DshOutcome::Written
             }
@@ -697,8 +747,21 @@ mod imp {
         let eol = if crlf { "\r\n" } else { "\n" };
         let mut text = lines.join(eol);
         text.push_str(eol);
-        std::fs::write(path, text)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cordis.patch.yml");
+        let tmp = path.with_file_name(format!("{file_name}.llmtrim-tmp"));
+        std::fs::write(&tmp, text).with_context(|| format!("failed to write {}", tmp.display()))?;
+        // Rename over the original: the old content survives until this succeeds, so a crash
+        // leaves the user's patch file intact (worst case a stale `.llmtrim-tmp` beside it).
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!(
+                "failed to replace {} (the new content is at {})",
+                path.display(),
+                tmp.display()
+            )
+        })?;
         Ok(outcome)
     }
 
@@ -718,16 +781,28 @@ mod imp {
     /// `USERPROFILE` on Windows. Note `crate::daemon::home_dir()` is *not* this — it is llmtrim's
     /// own state dir (`$LLMTRIM_HOME`/`~/.llmtrim`).
     fn dsh_patch_path() -> Result<(PathBuf, bool)> {
-        if let Some(home) = std::env::var_os("DSH_HOME").filter(|v| !v.is_empty()) {
-            let dir = PathBuf::from(home);
-            return Ok((dir.join("cordis.patch.yml"), true));
+        if let Some(dir) = std::env::var_os("DSH_HOME").filter(|v| !v.is_empty()) {
+            return Ok(dsh_patch_path_from_dsh_home(&dir));
         }
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .context("neither HOME nor USERPROFILE is set")?;
-        let dir = PathBuf::from(home).join(".dsh");
+        Ok(dsh_patch_path_from_home(std::path::Path::new(&home)))
+    }
+
+    /// `$DSH_HOME/cordis.patch.yml`. An explicit home counts as installed on its own — the user
+    /// pointed us at it.
+    fn dsh_patch_path_from_dsh_home(dir: &std::ffi::OsStr) -> (PathBuf, bool) {
+        (PathBuf::from(dir).join("cordis.patch.yml"), true)
+    }
+
+    /// `~/.dsh/cordis.patch.yml`, present only when the install looks real (`profiles/` exists),
+    /// so we never create `~/.dsh` for an app that is not installed. Pure, so the heuristic is
+    /// testable without touching the process environment.
+    fn dsh_patch_path_from_home(home: &std::path::Path) -> (PathBuf, bool) {
+        let dir = home.join(".dsh");
         let installed = dir.join("profiles").is_dir();
-        Ok((dir.join("cordis.patch.yml"), installed))
+        (dir.join("cordis.patch.yml"), installed)
     }
 
     /// Report that there is no DSH here: an error when the user named DSH (`--client dsh`), a
@@ -773,7 +848,7 @@ mod imp {
                 )
             }
             DshOutcome::Stale => anyhow::bail!(
-                "{} already has an llmtrim entry that differs; re-run with `--force` to rewrite it.",
+                "{} already has an llmtrim entry that differs from the canonical `serverName: llmtrim` + `command: llmtrim` + `args: [mcp]`; re-run with `--force` to rewrite it.",
                 path.display()
             ),
         }
@@ -1122,12 +1197,35 @@ mod imp {
             assert_eq!(lines[range.expect("found").start].trim(), DSH_BEGIN);
         }
 
-        /// A fresh patch path per test; the tag keeps the parallel test runner from sharing files.
-        fn temp_patch(tag: &str) -> std::path::PathBuf {
+        #[test]
+        fn dsh_entry_accepts_a_quoted_command_and_flow_args() {
+            // DSH's own profile layer writes quoted scalars and flow arg lists, so the same
+            // registration must not read as stale just because it is spelled that way.
+            let quoted = DSH_BLOCK
+                .replace("command: llmtrim", "command: 'llmtrim'")
+                .replace("      args:\n        - mcp\n", "      args: [mcp]\n");
+            assert_eq!(state_of(&quoted), DshEntry::Current);
+        }
+
+        #[test]
+        fn dsh_entry_rejects_a_foreign_server_name() {
+            // Same command, different namespace: the tools would appear as `mcp__other__…`, so this
+            // is not our registration and has to be rewriteable with --force.
+            let foreign = DSH_BLOCK.replace("serverName: llmtrim", "serverName: other");
+            assert_eq!(state_of(&foreign), DshEntry::Stale);
+        }
+
+        /// A fresh temp directory per test; the tag keeps the parallel test runner from sharing files.
+        fn temp_dir_for(tag: &str) -> std::path::PathBuf {
             let dir =
                 std::env::temp_dir().join(format!("llmtrim-mcp-dsh-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("temp dir");
-            dir.join("cordis.patch.yml")
+            dir
+        }
+
+        /// A fresh patch path per test.
+        fn temp_patch(tag: &str) -> std::path::PathBuf {
+            temp_dir_for(tag).join("cordis.patch.yml")
         }
 
         #[test]
@@ -1241,6 +1339,80 @@ mod imp {
         }
 
         #[test]
+        fn dsh_install_refuses_a_row_it_cannot_parse_instead_of_duplicating_it() {
+            let path = temp_patch("unparsed");
+            let grouped = "\
+- id: some-group
+  insert:
+    - id: mcp-llmtrim
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: llmtrim
+        command: llmtrim
+";
+            std::fs::write(&path, grouped).expect("seed");
+
+            // Two rows for one id mount two mcp-client fibers on a reserved serverName, which fails
+            // at DSH boot, so refusing is the only safe answer.
+            assert!(install_dsh_at(&path, false).is_err());
+            assert!(install_dsh_at(&path, true).is_err());
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), grouped);
+        }
+
+        #[test]
+        fn dsh_install_appends_to_a_file_without_a_trailing_newline() {
+            let path = temp_patch("no-newline");
+            std::fs::write(&path, "- id: keep-me\n  disabled: false").expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, false).expect("write"),
+                DshOutcome::Written
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert!(after.contains("- id: keep-me\n  disabled: false\n\n"));
+            assert!(after.ends_with(&format!("{DSH_END}\n")));
+            assert_eq!(after.matches("- id: mcp-llmtrim").count(), 1);
+        }
+
+        #[test]
+        fn dsh_install_leaves_no_temp_file_behind() {
+            let path = temp_patch("atomic");
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(
+                install_dsh_at(&path, false).expect("write"),
+                DshOutcome::Written
+            );
+            assert!(
+                !path.with_file_name("cordis.patch.yml.llmtrim-tmp").exists(),
+                "the atomic write must clean up after itself"
+            );
+        }
+
+        #[test]
+        fn dsh_patch_path_resolution_is_pure_and_conservative() {
+            // No `profiles/` directory: not a DSH install, so `--client dsh` refuses rather than
+            // creating `~/.dsh` for an app that is not there.
+            let home = temp_dir_for("path");
+            let (path, installed) = dsh_patch_path_from_home(&home);
+            assert_eq!(path, home.join(".dsh").join("cordis.patch.yml"));
+            assert!(!installed);
+
+            std::fs::create_dir_all(home.join(".dsh").join("profiles")).expect("profiles dir");
+            let (path, installed) = dsh_patch_path_from_home(&home);
+            assert_eq!(path, home.join(".dsh").join("cordis.patch.yml"));
+            assert!(installed);
+
+            // An explicit `$DSH_HOME` is trusted as-is.
+            let (path, installed) =
+                dsh_patch_path_from_dsh_home(std::ffi::OsStr::new("D:\\explicit-dsh"));
+            assert_eq!(
+                path,
+                std::path::PathBuf::from("D:\\explicit-dsh").join("cordis.patch.yml")
+            );
+            assert!(installed);
+        }
+
+        #[test]
         fn dsh_absence_is_fatal_only_when_the_client_was_named() {
             // `--client dsh` asked for it by name, so a missing install must not look like success;
             // `--client all` merely tried it, so it is a note.
@@ -1250,7 +1422,7 @@ mod imp {
         }
 
         #[test]
-        fn dsh_print_mode_needs_no_install_and_writes_nothing() {
+        fn dsh_print_mode_needs_no_dsh_install() {
             // `--print` returns before any path is resolved, so it is usable on a machine with no
             // DSH at all — and `--client dsh --print` on this host must not touch the real home.
             install_dsh(true, false, true).expect("print mode");
