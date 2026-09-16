@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **DeepSeek dollars follow the published list again.** `deepseek-flash` replaced
+  `deepseek-v4-flash`, the retired ids still bill at Flash prices, and a cache hit is
+  billed at its own $0.003/1M tier instead of a fraction of the miss rate. Peak
+  (Beijing 09:00-12:00 / 14:00-18:00) still costs 2x off-peak and weekends stay
+  off-peak all day, but cache writes now bill as miss input rather than zero, and
+  DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` are read, so the
+  hit/miss split reaches the bill instead of pricing the whole prompt at the miss rate.
 - **`/sub` starts again on Claude Code resume.** Switching away (`/resume`, or
   `--resume` of another session) treated `SessionEnd(reason=resume)` as a logout
   and minted a fresh empty window on the way back, so window-local subscription
