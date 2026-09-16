@@ -338,7 +338,17 @@ mod tests {
         let second = tempdir("second");
         std::fs::write(first.join("tool.cmd"), "@echo off\r\n").expect("shim");
         std::fs::write(second.join("tool.cmd"), "@echo off\r\n").expect("other");
-        let path = format!("{};{}", first.display(), second.display());
+        // `join_paths`, not a hardcoded `;`: that separator is Windows-only, so on Linux and
+        // macOS the two directories would read as one path and the probe would find nothing.
+        // It is the exact inverse of the `split_paths` the resolver calls.
+        let path = std::env::join_paths([&first, &second]).expect("join PATH");
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(
+            std::env::split_paths(&path).count(),
+            2,
+            "PATH must round-trip as two entries; a single entry means the join/parse pair \
+             regressed and this test would then pass on Windows only"
+        );
         assert_eq!(
             resolve_candidate("tool", Some(&path)),
             Some(Candidate::Script(first.join("tool.cmd")))
