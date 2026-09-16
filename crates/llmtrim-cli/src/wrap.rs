@@ -5,10 +5,9 @@
 //!   1. Confirm the interceptor is wired (the same `HTTPS_PROXY` mechanism `setup`
 //!      installs and `start` checks), so the agent's HTTPS to LLM hosts routes through
 //!      llmtrim — there is **no** per-agent quirk handling, no base-URL writing, no
-//!      allow-list of "supported" agents. Any binary on PATH works. One exception:
-//!      on Windows, the DeepSeek Harness CLI (`dsh`) is an npm `.cmd`/`.ps1` shim that
-//!      `Command` cannot exec directly, so `wrap` resolves it to
-//!      `node <shimDir>\node_modules\@deepseek-ai\dsh\lib\bin.js` (see `resolve_launch`).
+//!      allow-list of "supported" agents. Any binary on PATH works, and on Windows a
+//!      `.cmd`/`.bat`/`.ps1` shim is launched the way the shell would launch it (see
+//!      `resolve_launch_for_platform`).
 //!   2. Exec the named binary as a subprocess that inherits the current environment
 //!      (which, post-`setup` + a fresh shell, already carries `HTTPS_PROXY` and the CA
 //!      trust vars), forwarding the passthrough args and propagating its exit code.
@@ -95,9 +94,9 @@ pub fn run(raw: Vec<String>) -> Result<()> {
     let inv = parse_invocation(&raw)?;
     let color = ui::color_stdout();
 
-    // Resolve the real launch command up front (Windows `dsh` → node + bin.js), so
-    // readiness hints and the "not found" error talk about the agent the user typed.
-    let (program, final_args) = resolve_launch(&inv.agent, &inv.args, None)?;
+    // Resolve the real launch command up front (a Windows shim → `cmd /c` or PowerShell),
+    // so readiness hints and the "not found" error talk about the agent the user typed.
+    let launch = resolve_launch(&inv.agent, &inv.args, None)?;
 
     // Reuse the exact helpers `start`/`setup` use — do not reimplement the checks.
     let daemon_running = crate::daemon::running().is_some();
@@ -146,7 +145,7 @@ pub fn run(raw: Vec<String>) -> Result<()> {
         ui::paint(color, Tone::Dim, &format!("llmtrim wrap → {}", inv.agent))
     );
 
-    exec_agent(&program, &final_args, &inv.agent)
+    exec_agent(&launch, &inv.agent)
 }
 
 /// True when the agent binary looks like Claude Code (not Codex/Gemini/etc.).
@@ -159,62 +158,6 @@ fn agent_is_claude(agent: &str) -> bool {
     base == "claude" || base.starts_with("claude-") || base == "claude.exe"
 }
 
-/// True when the agent binary is the DeepSeek Harness CLI. On Windows `dsh` is an
-/// npm `.cmd`/`.ps1` shim that `Command` cannot exec directly (see `resolve_launch`).
-fn agent_is_dsh(agent: &str) -> bool {
-    let base = agent
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(agent)
-        .to_ascii_lowercase();
-    let base = base.as_str();
-    matches!(base, "dsh" | "dsh.exe" | "dsh.cmd" | "dsh.ps1")
-}
-
-/// First directory on `PATH` that contains a shim named `bin` (bare, `.exe`, `.cmd`,
-/// or `.ps1`). `path_env` is a seam for tests; `None` reads the live environment.
-fn shim_dir_on_path(bin: &str, path_env: Option<&str>) -> Option<PathBuf> {
-    let path = match path_env {
-        Some(p) => p.to_string(),
-        None => std::env::var_os("PATH")?.to_string_lossy().into_owned(),
-    };
-    let names = [
-        bin.to_string(),
-        format!("{bin}.exe"),
-        format!("{bin}.cmd"),
-        format!("{bin}.ps1"),
-    ];
-    std::env::split_paths(&path).find(|dir| names.iter().any(|n| dir.join(n).is_file()))
-}
-
-/// Directory of an explicitly passed shim path such as `C:\Users\me\npm\dsh.cmd`.
-fn explicit_shim_dir(agent: &str) -> Option<PathBuf> {
-    let path = Path::new(agent);
-    if path.components().count() <= 1 || !path.is_file() {
-        return None;
-    }
-    path.parent().map(Path::to_path_buf)
-}
-
-/// Resolve either an explicit shim path or the first PATH shim directory.
-fn dsh_shim_dir(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
-    explicit_shim_dir(agent).or_else(|| shim_dir_on_path("dsh", path_env))
-}
-
-/// Derive the npm-installed entry script next to a `dsh` shim, if present.
-fn dsh_node_entry(agent: &str, path_env: Option<&str>) -> Option<PathBuf> {
-    let dir = dsh_shim_dir(agent, path_env)?;
-    let entry = dir
-        .join("node_modules")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("lib")
-        .join("bin.js");
-    entry.is_file().then_some(entry)
-}
-
-/// Rewrite a `wrap` invocation into the real (program, args) to launch.
-///
 /// Script extensions Rust's `Command` cannot exec directly on Windows.
 const SHIM_EXTS: &[&str] = &["cmd", "bat", "ps1"];
 
@@ -284,49 +227,79 @@ fn cmd_line(shim: &Path, args: &[String]) -> String {
     line
 }
 
-/// Only Windows `dsh` is special: npm ships `dsh` as `.cmd`/`.ps1` shims that Rust's
-/// `Command` cannot exec directly, so we resolve the shim's directory on PATH and
-/// launch `node <shimDir>\node_modules\@deepseek-ai\dsh\lib\bin.js`. Every other
-/// agent resolves to itself (today's generic behavior). `path_env` is a seam for
-/// tests; `None` reads the live environment.
-fn resolve_launch(
-    agent: &str,
-    args: &[String],
-    path_env: Option<&str>,
-) -> Result<(String, Vec<String>)> {
+/// What `exec_agent` should run: a program plus either ordinary args, or a pre-built
+/// `cmd.exe` command line that must be appended verbatim.
+struct Launch {
+    program: String,
+    args: Vec<String>,
+    raw_tail: Option<String>,
+}
+
+/// Rewrite a `wrap` invocation into what to launch. `path_env` is a seam for tests;
+/// `None` reads the live environment.
+fn resolve_launch(agent: &str, args: &[String], path_env: Option<&str>) -> Result<Launch> {
     resolve_launch_for_platform(agent, args, path_env, cfg!(windows))
 }
 
+/// On Windows a shim (`.cmd`/`.bat`/`.ps1`) is a script, not an executable, so `Command`
+/// cannot run it — and `Command` never consults `PATHEXT`, which is why a bare `dsh`
+/// looked for `dsh.exe` and missed `dsh.cmd`. Any agent is handled: `.cmd`/`.bat` go
+/// through `cmd /c`, `.ps1` through PowerShell `-File`. Everything else — including a
+/// POSIX shim, which is a shebang script — passes through untouched.
 fn resolve_launch_for_platform(
     agent: &str,
     args: &[String],
     path_env: Option<&str>,
     is_windows: bool,
-) -> Result<(String, Vec<String>)> {
-    if is_windows && agent_is_dsh(agent) {
-        if let Some(entry) = dsh_node_entry(agent, path_env) {
-            let mut final_args = Vec::with_capacity(args.len() + 1);
-            final_args.push(entry.to_string_lossy().into_owned());
+) -> Result<Launch> {
+    if is_windows && let Some(shim) = shim_path(agent, path_env) {
+        let is_ps1 = shim
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ps1"));
+        if is_ps1 {
+            let mut final_args = vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                shim.to_string_lossy().into_owned(),
+            ];
             final_args.extend(args.iter().cloned());
-            return Ok(("node".to_string(), final_args));
+            return Ok(Launch {
+                program: "powershell".to_string(),
+                args: final_args,
+                raw_tail: None,
+            });
         }
-        // dsh shim present but entry missing → actionable hint.
-        if dsh_shim_dir(agent, path_env).is_some() {
-            anyhow::bail!(
-                "found the `dsh` shim but no `node_modules\\@deepseek-ai\\dsh\\lib\\bin.js` \
-                 beside it — run `npm install -g @deepseek-ai/dsh` and try again"
-            );
-        }
+        return Ok(Launch {
+            program: "cmd".to_string(),
+            args: Vec::new(),
+            raw_tail: Some(format!("/c {}", cmd_line(&shim, args))),
+        });
     }
-    Ok((agent.to_string(), args.to_vec()))
+    Ok(Launch {
+        program: agent.to_string(),
+        args: args.to_vec(),
+        raw_tail: None,
+    })
 }
 
 /// Launch the resolved program and propagate its exit code. This is the real-IO
 /// entrypoint (it spawns a subprocess), so it is left uncovered by unit tests — the
 /// testable logic lives in `parse_invocation` / `readiness` / `resolve_launch`.
-fn exec_agent(program: &str, args: &[String], display: &str) -> Result<()> {
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args);
+fn exec_agent(launch: &Launch, display: &str) -> Result<()> {
+    let mut cmd = std::process::Command::new(&launch.program);
+    cmd.args(&launch.args);
+    // `cmd.exe` parses a command line, not an argv array, so the shim tail is escaped for
+    // it and appended verbatim rather than re-quoted by `Command::args`.
+    #[cfg(windows)]
+    if let Some(tail) = &launch.raw_tail {
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg(format!(" {tail}"));
+    }
+    #[cfg(not(windows))]
+    let _ = &launch.raw_tail;
     // Always-sub skip-login: Claude Code must not require a live Anthropic OAuth session.
     // Only inject for Claude-ish binaries — never pollute codex/gemini/etc.
     // Prefer an already-set user value; only inject when missing so a real key still wins.
@@ -392,7 +365,10 @@ mod tests {
         let dir = tempdir("probe");
         std::fs::write(dir.join("mytool.cmd"), "@echo off\r\n").expect("shim");
         let path = dir.to_string_lossy().into_owned();
-        assert_eq!(shim_path("mytool", Some(&path)), Some(dir.join("mytool.cmd")));
+        assert_eq!(
+            shim_path("mytool", Some(&path)),
+            Some(dir.join("mytool.cmd"))
+        );
         assert_eq!(
             shim_path("mytool.cmd", Some(&path)),
             Some(dir.join("mytool.cmd"))
@@ -414,6 +390,66 @@ mod tests {
         let dir = tempdir("exe");
         std::fs::write(dir.join("mytool.exe"), b"MZ").expect("exe");
         assert_eq!(shim_path("mytool", Some(&dir.to_string_lossy())), None);
+    }
+
+    #[test]
+    fn windows_shim_launches_through_cmd() {
+        let dir = tempdir("cmd-launch");
+        std::fs::write(dir.join("mytool.cmd"), "@echo off\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let args = s(&["web"]);
+        let launch =
+            resolve_launch_for_platform("mytool", &args, Some(&path), true).expect("resolve");
+        assert_eq!(launch.program, "cmd");
+        assert_eq!(
+            launch.raw_tail,
+            Some(format!("/c {}", cmd_line(&dir.join("mytool.cmd"), &args)))
+        );
+        assert!(launch.args.is_empty());
+    }
+
+    #[test]
+    fn windows_ps1_launches_through_powershell() {
+        let dir = tempdir("ps1-launch");
+        let shim = dir.join("mytool.ps1");
+        std::fs::write(&shim, "Write-Output hi\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch =
+            resolve_launch_for_platform("mytool", &[], Some(&path), true).expect("resolve");
+        assert_eq!(launch.program, "powershell");
+        assert_eq!(
+            launch.args,
+            s(&[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &shim.to_string_lossy(),
+            ])
+        );
+        assert_eq!(launch.raw_tail, None);
+    }
+
+    #[test]
+    fn unix_shim_passes_through_untouched() {
+        let dir = tempdir("unix-shim");
+        std::fs::write(dir.join("mytool.cmd"), "@echo off\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch =
+            resolve_launch_for_platform("mytool", &[], Some(&path), false).expect("resolve");
+        assert_eq!(launch.program, "mytool");
+        assert_eq!(launch.raw_tail, None);
+    }
+
+    #[test]
+    fn exe_and_unknown_agents_pass_through() {
+        let dir = tempdir("passthrough");
+        std::fs::write(dir.join("mytool.exe"), b"MZ").expect("exe");
+        let path = dir.to_string_lossy().into_owned();
+        let exe = resolve_launch_for_platform("mytool", &[], Some(&path), true).expect("resolve");
+        assert_eq!(exe.program, "mytool");
+        let unknown = resolve_launch_for_platform("nope", &[], Some(&path), true).expect("resolve");
+        assert_eq!(unknown.program, "nope");
     }
 
     #[test]
@@ -479,146 +515,5 @@ mod tests {
         assert!(!agent_is_claude("codex"));
         assert!(!agent_is_claude("gemini"));
         assert!(!agent_is_claude("/usr/bin/aider"));
-    }
-
-    #[test]
-    fn agent_is_dsh_matches_dsh_binaries_only() {
-        assert!(agent_is_dsh("dsh"));
-        assert!(agent_is_dsh("dsh.exe"));
-        assert!(agent_is_dsh("dsh.cmd"));
-        assert!(agent_is_dsh("dsh.ps1"));
-        assert!(agent_is_dsh(r"C:\Tools\dsh.exe"));
-        assert!(agent_is_dsh("/usr/bin/dsh"));
-        assert!(!agent_is_dsh("claude"));
-        assert!(!agent_is_dsh("codex"));
-        assert!(!agent_is_dsh("dsh-custom"));
-    }
-
-    #[test]
-    fn non_dsh_agents_resolve_to_themselves() {
-        let out = resolve_launch("claude", &s(&["--x"]), Some("C:\\bin")).expect("generic");
-        assert_eq!(out, ("claude".to_string(), s(&["--x"])));
-        let out = resolve_launch("codex", &[], Some("C:\\bin")).expect("generic");
-        assert_eq!(out, ("codex".to_string(), Vec::<String>::new()));
-    }
-
-    #[test]
-    fn dsh_resolves_to_node_entry_when_shim_and_entry_present() {
-        let dir = std::env::temp_dir().join(format!("llmtrim-wrap-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(
-            dir.join("node_modules")
-                .join("@deepseek-ai")
-                .join("dsh")
-                .join("lib"),
-        )
-        .expect("mkdir");
-        std::fs::write(dir.join("dsh.cmd"), "@echo off\r\nexit /b 0\r\n").expect("shim");
-        std::fs::write(
-            dir.join("node_modules")
-                .join("@deepseek-ai")
-                .join("dsh")
-                .join("lib")
-                .join("bin.js"),
-            "#!/usr/bin/env node\r\n",
-        )
-        .expect("entry");
-
-        let path = dir.to_string_lossy().into_owned();
-        let out = resolve_launch_for_platform("dsh", &s(&["web"]), Some(path.as_str()), true)
-            .expect("resolve");
-        assert_eq!(out.0, "node");
-        assert_eq!(out.1.len(), 2);
-        assert!(
-            out.1[0].ends_with("node_modules\\@deepseek-ai\\dsh\\lib\\bin.js")
-                || out.1[0].ends_with("node_modules/@deepseek-ai/dsh/lib/bin.js")
-        );
-        assert_eq!(out.1[1], "web");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dsh_resolves_explicit_shim_path_to_adjacent_node_entry() {
-        let dir =
-            std::env::temp_dir().join(format!("llmtrim-wrap-explicit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(
-            dir.join("node_modules")
-                .join("@deepseek-ai")
-                .join("dsh")
-                .join("lib"),
-        )
-        .expect("mkdir");
-        let shim = dir.join("dsh.cmd");
-        std::fs::write(&shim, "@echo off\r\nexit /b 0\r\n").expect("shim");
-        std::fs::write(
-            dir.join("node_modules")
-                .join("@deepseek-ai")
-                .join("dsh")
-                .join("lib")
-                .join("bin.js"),
-            "#!/usr/bin/env node\r\n",
-        )
-        .expect("entry");
-
-        let out = resolve_launch_for_platform(
-            shim.to_string_lossy().as_ref(),
-            &s(&["web"]),
-            Some(""),
-            true,
-        )
-        .expect("resolve");
-        assert_eq!(out.0, "node");
-        assert_eq!(out.1.len(), 2);
-        assert!(
-            out.1[0].ends_with("node_modules\\@deepseek-ai\\dsh\\lib\\bin.js")
-                || out.1[0].ends_with("node_modules/@deepseek-ai/dsh/lib/bin.js")
-        );
-        assert_eq!(out.1[1], "web");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dsh_with_shim_but_no_entry_returns_npm_install_hint() {
-        let dir = std::env::temp_dir().join(format!("llmtrim-wrap-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("dsh.cmd"), "@echo off\r\nexit /b 0\r\n").expect("shim");
-
-        let path = dir.to_string_lossy().into_owned();
-        let err = resolve_launch_for_platform("dsh", &[], Some(path.as_str()), true)
-            .expect_err("should error");
-        assert!(err.to_string().contains("npm install -g @deepseek-ai/dsh"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn explicit_dsh_shim_without_entry_returns_npm_install_hint() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmtrim-wrap-explicit-missing-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let shim = dir.join("dsh.cmd");
-        std::fs::write(&shim, "@echo off\r\nexit /b 0\r\n").expect("shim");
-
-        let err = resolve_launch_for_platform(shim.to_string_lossy().as_ref(), &[], Some(""), true)
-            .expect_err("should error");
-        assert!(err.to_string().contains("npm install -g @deepseek-ai/dsh"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dsh_not_on_path_resolves_to_itself() {
-        // No dsh shim anywhere on PATH → generic behavior (the later exec error
-        // handles the not-found case, matching today's semantics for any agent).
-        let out =
-            resolve_launch_for_platform("dsh", &[], Some("C:\\other"), true).expect("generic");
-        assert_eq!(out, ("dsh".to_string(), Vec::<String>::new()));
     }
 }
