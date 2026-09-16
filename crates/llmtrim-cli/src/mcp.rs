@@ -646,27 +646,29 @@ mod imp {
             .any(|(i, _)| row_id(&line[i + 1..]).as_deref() == Some(want))
     }
 
-    /// How many entries the block's `insert:` list holds. Entries are list items at the indentation
-    /// of our own row, so a deeper `- ` line — an `args:` item — is not one. More than one means we
-    /// do not solely own the list: rewriting it would delete a sibling registration.
-    fn insert_entries(block: &[String]) -> usize {
-        let mut indent = None;
-        for line in block {
-            if row_id(line).as_deref() == Some(ROW_ID) {
-                indent = Some(line.len() - line.trim_start().len());
-                break;
-            }
-        }
-        let Some(indent) = indent else {
-            return 0;
-        };
+    /// Is this line a list item (`- …`)? An `id:` key nested inside another item's mapping is not,
+    /// so a foreign config that happens to contain `id: mcp-llmtrim` — under an `env:` mapping,
+    /// say — is never mistaken for our row.
+    fn is_list_item(line: &str) -> bool {
+        let t = line.trim_start();
+        t == "-" || t.starts_with("- ")
+    }
+
+    /// This line's indentation.
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// The item level of an `insert:` list: the shallowest indentation at which a list item
+    /// appears. Items deeper than that — an `args:` entry, a nested list inside an item's config —
+    /// are not entries of the list.
+    fn item_indent(block: &[String]) -> Option<usize> {
         block
             .iter()
-            .filter(|l| {
-                l.len() - l.trim_start().len() == indent
-                    && (l.trim_start().starts_with("- ") || l.trim() == "-")
-            })
-            .count()
+            .map(String::as_str)
+            .filter(|l| is_list_item(l))
+            .map(indent_of)
+            .min()
     }
 
     /// Find our insert block: a column-0 `- insert:` whose list holds a row with our id, running to
@@ -698,14 +700,48 @@ mod imp {
                 }
                 end += 1;
             }
-            if lines[i..end].iter().any(|l| line_mentions_id(l, ROW_ID)) {
-                let start = if i > 0 && lines[i - 1].trim() == DSH_BEGIN {
-                    i - 1
-                } else {
-                    i
-                };
-                hits.push((i, start, end));
+            let block = &lines[i..end];
+            // The list body, not the `- insert:` header: the header is itself a list item (at indent
+            // 0), so including it would make the item level 0 and no nested row could ever match.
+            let Some(level) = item_indent(&lines[i + 1..end]) else {
+                i = end;
+                continue;
+            };
+            // Ours only if a list item *at the list's item level* carries our id. A deeper `id:` key
+            // is configuration data in someone else's entry, not a row.
+            let ours = block.iter().map(String::as_str).any(|l| {
+                is_list_item(l) && indent_of(l) == level && row_id(l).as_deref() == Some(ROW_ID)
+            });
+            if !ours {
+                i = end;
+                continue;
             }
+            // More than one item at the list's level means we do not solely own the list: rewriting
+            // it would delete a sibling registration. Counting at the list's item level — not at our
+            // own row's indent — is what catches a sibling written at another indent.
+            let entries = block
+                .iter()
+                .map(String::as_str)
+                .filter(|l| is_list_item(l) && indent_of(l) == level)
+                .count();
+            if hits.is_empty() && entries > 1 {
+                return (
+                    DshEntry::Refuse(format!(
+                        "the `- insert:` list at line {} holds more than one entry, so llmtrim does not \
+                         solely own it; rewriting it would drop the other registrations. Move our row \
+                         into its own `- insert:` list by hand and re-run — `--force` does not rewrite \
+                         this.",
+                        i + 1
+                    )),
+                    None,
+                );
+            }
+            let start = if i > 0 && lines[i - 1].trim() == DSH_BEGIN {
+                i - 1
+            } else {
+                i
+            };
+            hits.push((i, start, end));
             i = end;
         }
 
@@ -729,18 +765,6 @@ mod imp {
             );
         }
         let (insert, start, end) = hits[0];
-        if insert_entries(&lines[insert..end]) > 1 {
-            return (
-                DshEntry::Refuse(format!(
-                    "the `- insert:` list at line {} holds more than one entry, so llmtrim does not \
-                     solely own it; rewriting it would drop the other registrations. Move our row \
-                     into its own `- insert:` list by hand and re-run — `--force` does not rewrite \
-                     this.",
-                    insert + 1
-                )),
-                None,
-            );
-        }
         let state = if launches_llmtrim(&lines[insert..end]) {
             DshEntry::Current
         } else {
@@ -758,7 +782,7 @@ mod imp {
     /// the file.
     fn has_unparsed_llmtrim_row(lines: &[String]) -> bool {
         lines.iter().any(|l| {
-            if l.trim().starts_with('#') || !line_mentions_id(l, ROW_ID) {
+            if l.trim().starts_with('#') || !is_list_item(l) || !line_mentions_id(l, ROW_ID) {
                 return false;
             }
             let indented = l.len() != l.trim_start().len();
@@ -1733,6 +1757,88 @@ mod imp {
             let after = std::fs::read_to_string(&path).expect("read");
             assert_eq!(after.matches("mcp-llmtrim").count(), 1);
             assert!(after.contains("      command: llmtrim\n"), "{after}");
+        }
+
+        #[test]
+        fn dsh_install_never_claims_a_foreign_block_by_a_nested_id() {
+            // A foreign entry whose config happens to contain `id: mcp-llmtrim` is not our row: that
+            // id is a mapping key inside the other entry, not a list item of the insert list.
+            // Claiming it made `--force` splice the whole block and delete the foreign registration.
+            let content = "- insert:\n  - id: mcp-playwright\n    name: '@deepseek-ai/dsh-mcp-client'\n    config:\n      serverName: playwright\n      command: npx\n      args:\n        - '@playwright/mcp'\n      env:\n        a: b\n        id: mcp-llmtrim\n";
+            assert!(
+                content.contains("\n        id: mcp-llmtrim\n"),
+                "the foreign id stays nested under `env:`"
+            );
+
+            for force in [false, true] {
+                let path = temp_patch(if force {
+                    "nested-id-force"
+                } else {
+                    "nested-id"
+                });
+                std::fs::write(&path, content).expect("seed");
+
+                assert_eq!(
+                    install_dsh_at(&path, force).expect("append"),
+                    DshOutcome::Written
+                );
+                let after = std::fs::read_to_string(&path).expect("read");
+                assert!(
+                    after.starts_with(content),
+                    "the foreign block is untouched: {after}"
+                );
+                assert!(
+                    after.contains("  - id: mcp-playwright\n"),
+                    "the foreign entry survives: {after}"
+                );
+                assert!(after.contains("      command: llmtrim\n"), "{after}");
+            }
+        }
+
+        #[test]
+        fn dsh_install_refuses_a_row_below_the_list_item_level() {
+            // Our row is a list item, but the list's item level is the foreign entry's indent, so we
+            // do not solely own this list: rewriting it would delete playwright.
+            let content = "- insert:\n  - id: mcp-playwright\n    name: '@deepseek-ai/dsh-mcp-client'\n    config:\n      serverName: playwright\n      command: npx\n    - id: mcp-llmtrim\n";
+            assert!(
+                content.contains("\n    - id: mcp-llmtrim\n"),
+                "our row sits below the item level"
+            );
+
+            for force in [false, true] {
+                let path = temp_patch(if force { "deep-row-force" } else { "deep-row" });
+                std::fs::write(&path, content).expect("seed");
+
+                let err = install_dsh_at(&path, force).expect_err("must refuse");
+                assert!(err.to_string().contains("mcp-llmtrim"), "{err}");
+                assert_eq!(std::fs::read_to_string(&path).expect("read"), content);
+            }
+        }
+
+        #[test]
+        fn dsh_install_force_stops_at_the_next_top_level_row() {
+            // The most common real terminator: the next column-0 row. `--force` must rewrite only
+            // our row and leave that row alone.
+            let content = "- insert:\n  - id: mcp-llmtrim\n    name: '@deepseek-ai/dsh-mcp-client'\n    config:\n      serverName: llmtrim\n      command: C:\\old\\llmtrim.exe\n      args:\n        - mcp\n- id: keep-me\n  disabled: true\n";
+            assert!(
+                content.contains("\n- id: keep-me\n"),
+                "the terminator row is at column 0"
+            );
+            let path = temp_patch("next-top-level-row");
+            std::fs::write(&path, content).expect("seed");
+
+            assert_eq!(
+                install_dsh_at(&path, true).expect("rewrite"),
+                DshOutcome::Rewritten
+            );
+            let after = std::fs::read_to_string(&path).expect("read");
+            assert!(
+                after.contains("- id: keep-me\n  disabled: true\n"),
+                "the next top-level row survives: {after}"
+            );
+            assert!(after.contains("      command: llmtrim\n"), "{after}");
+            assert_eq!(after.matches("- insert:").count(), 1);
+            assert_eq!(after.matches("- id: mcp-llmtrim").count(), 1);
         }
 
         #[test]
