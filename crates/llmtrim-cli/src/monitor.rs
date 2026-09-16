@@ -1159,6 +1159,28 @@ fn cache_multipliers(provider: &str) -> (f64, f64) {
     }
 }
 
+/// Rates for the cache components of an aggregate figure. DeepSeek's published rates are
+/// per-tier, so this uses the **off-peak** tier — the same basis `llm_prices` returns and
+/// every other aggregate in the dashboard uses. The Overview's money comes from the frozen
+/// per-turn rates in `breakdown_turns` and is exact; this is the legacy `cost` JSON path.
+///
+/// ponytail: off-peak for every DeepSeek turn, so a peak-heavy day reads low on the cache
+/// share (peak is 2x). Ceiling accepted because the exact figure already exists in the
+/// frozen money path; upgrade by aggregating `breakdown_turns` rates here instead.
+fn aggregate_rates(provider: &str, model: &str) -> BreakdownRates {
+    if let Some((_peak, off_peak)) = deepseek_rates(model) {
+        return off_peak;
+    }
+    let (input, output) = llm_prices(model).unwrap_or((0.0, 0.0));
+    let (read_mult, write_mult) = cache_multipliers(provider);
+    BreakdownRates {
+        input,
+        output,
+        cache_read: input * read_mult,
+        cache_write: input * write_mult,
+    }
+}
+
 /// USD cost figures priced per model via `llm_prices`, `None` when no recorded model
 /// is priced.
 ///
@@ -1196,12 +1218,13 @@ pub fn cost_estimate(models: &[ModelRow]) -> Option<Cost> {
             cost.out_spend += out;
             cost.out_spend_shaped += m.output_after_shaped as f64 / 1_000_000.0 * output_price;
 
-            let (read_mult, write_mult) = cache_multipliers(&m.provider);
-            let net_bill = (m.fresh_input_est as f64
-                + m.cache_write as f64 * write_mult
-                + m.cache_read as f64 * read_mult)
-                / 1_000_000.0
-                * input_price;
+            // Cache components come from the published rates, not the OpenAI multipliers:
+            // DeepSeek's cache read is its own tier ($0.003), not 0.50 x input.
+            let rates = aggregate_rates(&m.provider, model_id);
+            let net_bill = (m.fresh_input_est as f64 * rates.input
+                + m.cache_write as f64 * rates.cache_write
+                + m.cache_read as f64 * rates.cache_read)
+                / 1_000_000.0;
             // What was really paid for this model: cache-discounted input + measured output.
             cost.net_spend += net_bill + out;
             // The .min(0.95) clamp is load-bearing: it bounds the `1 - pct` denominator below
@@ -1217,9 +1240,9 @@ pub fn cost_estimate(models: &[ModelRow]) -> Option<Cost> {
             // the net blend assumes — so price the cut at that mix. No usage split recorded
             // → rate 1.0, degrading to the list figure.
             let live_used = m.fresh_input_est + m.cache_write;
-            let live_rate = if live_used > 0 {
-                (m.fresh_input_est as f64 + m.cache_write as f64 * write_mult.max(1.0))
-                    / live_used as f64
+            let live_rate = if live_used > 0 && rates.input > 0.0 {
+                (m.fresh_input_est as f64 * rates.input + m.cache_write as f64 * rates.cache_write)
+                    / (live_used as f64 * rates.input)
             } else {
                 1.0
             };
@@ -2109,6 +2132,33 @@ mod tests {
         assert_eq!(v["requests"], 2);
         assert_eq!(v["daemon"], serde_json::Value::Null);
         assert!(v["by_model"].as_array().is_some_and(|m| !m.is_empty()));
+    }
+
+    #[test]
+    fn cost_estimate_prices_deepseek_cache_reads_at_the_published_rate() {
+        // `ModelRow` derives only Debug+Clone, so every field is written out.
+        let row = ModelRow {
+            provider: "openai".to_string(),
+            model: Some("deepseek-flash".to_string()),
+            events: 1,
+            input_before: 1_000_000,
+            input_after: 1_000_000,
+            output_after: 0,
+            output_after_shaped: 0,
+            cache_read: 1_000_000,
+            cache_write: 0,
+            fresh_input_est: 0,
+            frozen_input_tokens: 0,
+            metered_input_before: 0,
+            metered_input_after: 0,
+        };
+        let cost = cost_estimate(&[row]).expect("priced");
+        // 1M cache reads at the published $0.003, not input $0.15 x the OpenAI 0.50 factor.
+        assert!(
+            (cost.net_spend - 0.003).abs() < 1e-9,
+            "net_spend {}",
+            cost.net_spend
+        );
     }
 
     #[test]
