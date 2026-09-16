@@ -1929,7 +1929,7 @@ fn run() -> Result<()> {
                 print,
                 force,
                 client,
-            }) => llmtrim::mcp::install(print, force, client)?,
+            }) => llmtrim::mcp::install_for_client(print, force, client)?,
         },
         Commands::Statusline { action } => match action {
             None => llmtrim::statusline::run()?,

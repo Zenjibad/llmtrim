@@ -25,12 +25,17 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(not(feature = "mcp"))]
-pub fn install(_print: bool, _force: bool, _client: McpClient) -> anyhow::Result<()> {
+pub fn install(_print: bool, _force: bool) -> anyhow::Result<()> {
+    anyhow::bail!("this build has no MCP server; rebuild with `--features mcp`")
+}
+
+#[cfg(not(feature = "mcp"))]
+pub fn install_for_client(_print: bool, _force: bool, _client: McpClient) -> anyhow::Result<()> {
     anyhow::bail!("this build has no MCP server; rebuild with `--features mcp`")
 }
 
 #[cfg(feature = "mcp")]
-pub use imp::{install, run};
+pub use imp::{install, install_for_client, run};
 
 /// The MCP handler the `mcp` command serves, for protocol-level tests that drive it over
 /// an in-memory transport instead of stdio. `db` is an isolated ledger path so the test
@@ -445,16 +450,30 @@ mod imp {
 
     /// Register the llmtrim MCP server with Claude Code via its own `claude mcp add` CLI (which
     /// owns the config file, so we don't hand-edit it); idempotent, with `--force` to reinstall a
-    /// stale entry. Any other client is served the config block to paste. `--print` skips all
-    /// writes and just emits that block.
+    /// stale entry. With no `claude` CLI on PATH it falls back to printing the config block to
+    /// paste. `--print` skips all writes and just emits that block.
     fn install_claude(print: bool, force: bool) -> Result<()> {
         install_with(print, force, run_claude)
     }
 
-    /// Register with the requested client(s). DSH is added in a later task.
-    pub fn install(print: bool, force: bool, client: McpClient) -> Result<()> {
+    /// Register the llmtrim MCP server with Claude Code. Kept at its original two-argument
+    /// signature: this crate is published as a library, so widening a public function's
+    /// parameters is a breaking API change the SemVer gate rejects. Other clients go through
+    /// [`install_for_client`].
+    pub fn install(print: bool, force: bool) -> Result<()> {
+        install_for_client(print, force, McpClient::Claude)
+    }
+
+    /// Register with the requested client. `--print` skips every write.
+    ///
+    /// DeepSeek Harness is added by a later task; until then those values fail loudly rather than
+    /// quietly registering Claude Code for a user who asked for something else.
+    pub fn install_for_client(print: bool, force: bool, client: McpClient) -> Result<()> {
         match client {
-            McpClient::Claude | McpClient::Dsh | McpClient::All => install_claude(print, force),
+            McpClient::Claude => install_claude(print, force),
+            McpClient::Dsh | McpClient::All => {
+                anyhow::bail!("`--client dsh`/`all` is not implemented on this build yet")
+            }
         }
     }
 
