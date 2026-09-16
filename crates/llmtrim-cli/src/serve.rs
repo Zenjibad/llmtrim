@@ -5121,7 +5121,10 @@ mod imp {
                     .or_else(|| v.pointer("/message/usage/cache_read_input_tokens"))
                     .and_then(Value::as_i64),
                 ProviderKind::OpenAi => v
-                    .pointer("/usage/prompt_tokens_details/cached_tokens") // Chat Completions
+                    // DeepSeek's native cache split: `api.deepseek.com` is OpenAI-shaped but
+                    // reports these, not `prompt_tokens_details.cached_tokens`.
+                    .pointer("/usage/prompt_cache_hit_tokens")
+                    .or_else(|| v.pointer("/usage/prompt_tokens_details/cached_tokens")) // Chat Completions
                     .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens")) // Responses
                     .or_else(|| v.pointer("/response/usage/input_tokens_details/cached_tokens"))
                     .and_then(Value::as_i64),
@@ -5187,12 +5190,18 @@ mod imp {
                         .or_else(|| v.pointer("/response/usage/input_tokens"))
                         .and_then(Value::as_i64);
                     let cached = v
-                        .pointer("/usage/prompt_tokens_details/cached_tokens")
+                        .pointer("/usage/prompt_cache_hit_tokens")
+                        .or_else(|| v.pointer("/usage/prompt_tokens_details/cached_tokens"))
                         .or_else(|| v.pointer("/usage/input_tokens_details/cached_tokens"))
                         .or_else(|| v.pointer("/response/usage/input_tokens_details/cached_tokens"))
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
-                    (prompt.map(|p| (p - cached).max(0)), None)
+                    // DeepSeek reports the uncached remainder directly; elsewhere it is
+                    // `prompt_tokens - cached_tokens`.
+                    let miss = v
+                        .pointer("/usage/prompt_cache_miss_tokens")
+                        .and_then(Value::as_i64);
+                    (miss.or_else(|| prompt.map(|p| (p - cached).max(0))), None)
                 }
                 ProviderKind::Google => {
                     let prompt = v
@@ -7036,6 +7045,23 @@ mod imp {
                 ),
                 "text delta must not count as empty success"
             );
+        }
+
+        #[test]
+        fn deepseek_native_cache_fields_are_read() {
+            let body = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":10,
+                "prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}}"#;
+            assert_eq!(extract_cache_read(ProviderKind::OpenAi, body), Some(800));
+            let (fresh, write) = extract_input_usage(ProviderKind::OpenAi, body);
+            assert_eq!(fresh, Some(200));
+            assert_eq!(write, None);
+
+            // Without DeepSeek's fields the OpenAI arithmetic still applies.
+            let openai = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":700}}}"#;
+            assert_eq!(extract_cache_read(ProviderKind::OpenAi, openai), Some(700));
+            let (fresh, _) = extract_input_usage(ProviderKind::OpenAi, openai);
+            assert_eq!(fresh, Some(300));
         }
 
         #[test]

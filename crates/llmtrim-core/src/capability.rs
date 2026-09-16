@@ -258,6 +258,7 @@ mod tests {
             "claude-opus-4-8",
             "gpt-5",
             "o3",
+            "deepseek-flash",
         ] {
             assert!(
                 model_is_reasoning_capable(id),
@@ -289,6 +290,7 @@ mod tests {
             ("openai/gpt-5", 400_000), // provider prefix stripped
             ("gpt-4o", 128_000),
             ("claude-opus-5", 1_000_000),
+            ("deepseek-flash", 1_000_000),
         ] {
             assert_eq!(context_window_for(id), Some(window), "{id}");
         }
