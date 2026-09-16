@@ -5,7 +5,9 @@
 //!   1. Confirm the interceptor is wired (the same `HTTPS_PROXY` mechanism `setup`
 //!      installs and `start` checks), so the agent's HTTPS to LLM hosts routes through
 //!      llmtrim — there is **no** per-agent quirk handling, no base-URL writing, no
-//!      allow-list of "supported" agents. Any binary on PATH works.
+//!      allow-list of "supported" agents. Any binary on PATH works, and on Windows a
+//!      `.cmd`/`.bat`/`.ps1` shim is launched the way the shell would launch it (see
+//!      `resolve_launch_for_platform`).
 //!   2. Exec the named binary as a subprocess that inherits the current environment
 //!      (which, post-`setup` + a fresh shell, already carries `HTTPS_PROXY` and the CA
 //!      trust vars), forwarding the passthrough args and propagating its exit code.
@@ -18,6 +20,7 @@
 //! wired (trivially safe: the contract — port + CA — is already in place, same as `start`).
 
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 use crate::ui::{self, Tone};
 
@@ -32,7 +35,9 @@ pub struct WrapInvocation {
 
 /// A few well-known agent names, used *only* to enrich the "not found" hint. This is NOT
 /// an allow-list: any binary on PATH is accepted. Kept tiny and advisory on purpose.
-const KNOWN_AGENTS: &[&str] = &["claude", "codex", "cursor", "aider", "copilot", "gemini"];
+const KNOWN_AGENTS: &[&str] = &[
+    "claude", "codex", "cursor", "aider", "copilot", "gemini", "dsh",
+];
 
 /// Split the raw `wrap` arguments into the agent and its passthrough args. The first token
 /// is the agent; everything after it is forwarded as-is. A leading `--` separator (clap
@@ -89,6 +94,11 @@ pub fn run(raw: Vec<String>) -> Result<()> {
     let inv = parse_invocation(&raw)?;
     let color = ui::color_stdout();
 
+    // Resolve what to launch up front — a Windows shim becomes its own program, a `.ps1` a
+    // PowerShell invocation — so the readiness hints and the "not found" error name the
+    // agent the user typed.
+    let launch = resolve_launch(&inv.agent, &inv.args, None)?;
+
     // Reuse the exact helpers `start`/`setup` use — do not reimplement the checks.
     let daemon_running = crate::daemon::running().is_some();
     let env_wired = https_proxy_is_local();
@@ -136,7 +146,7 @@ pub fn run(raw: Vec<String>) -> Result<()> {
         ui::paint(color, Tone::Dim, &format!("llmtrim wrap → {}", inv.agent))
     );
 
-    exec_agent(&inv)
+    exec_agent(&launch, &inv.agent)
 }
 
 /// True when the agent binary looks like Claude Code (not Codex/Gemini/etc.).
@@ -149,17 +159,130 @@ fn agent_is_claude(agent: &str) -> bool {
     base == "claude" || base.starts_with("claude-") || base == "claude.exe"
 }
 
-/// Launch the agent and propagate its exit code. This is the real-IO entrypoint (it spawns
-/// a subprocess), so it is left uncovered by unit tests — the testable logic lives in
-/// `parse_invocation` / `readiness`, which are tested below.
-fn exec_agent(inv: &WrapInvocation) -> Result<()> {
-    let mut cmd = std::process::Command::new(&inv.agent);
-    cmd.args(&inv.args);
+/// Extensions to probe, in the order a default Windows install resolves them. `.com` and
+/// `.exe` are included so a native binary beside a shim still wins — the shell would run
+/// it, and `Command` finds those itself.
+const SHIM_CANDIDATES: &[&str] = &["com", "exe", "bat", "cmd", "ps1"];
+
+/// What a name resolves to on Windows.
+#[derive(Debug, PartialEq, Eq)]
+enum Candidate {
+    /// A native executable: leave the name alone and let `Command` resolve it.
+    Native,
+    /// A script shim that must be launched through its interpreter.
+    Script(PathBuf),
+}
+
+/// Which candidate the shell would run for `agent`: a path is used as given, a bare name is
+/// probed directory by directory along PATH and extension by extension within each, so the
+/// first match in the first directory wins. A `.exe` beside a `.cmd` therefore resolves
+/// native, which is what typing the bare name would run. `path_env` is a seam for tests.
+fn resolve_candidate(agent: &str, path_env: Option<&str>) -> Option<Candidate> {
+    let classify = |p: PathBuf| {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "com" | "exe" => Some(Candidate::Native),
+            "bat" | "cmd" | "ps1" => Some(Candidate::Script(p)),
+            _ => None,
+        }
+    };
+    if agent.contains(['/', '\\']) {
+        let p = PathBuf::from(agent);
+        return p.is_file().then(|| classify(p)).flatten();
+    }
+    let path = match path_env {
+        Some(p) => p.to_string(),
+        None => std::env::var("PATH").ok()?,
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in SHIM_CANDIDATES {
+            let candidate = dir.join(format!("{agent}.{ext}"));
+            if candidate.is_file() {
+                return classify(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// What `exec_agent` should run.
+struct Launch {
+    program: String,
+    args: Vec<String>,
+}
+
+/// On Windows a `.cmd`/`.bat` is a script, so the resolved path becomes the program and
+/// `Command` wraps it in `cmd.exe` itself — argument escaping included, which it refuses
+/// rather than mangles (CVE-2024-24576). `.ps1` has no such handling in std and goes
+/// through PowerShell.
+fn launch_for_script(shim: PathBuf, args: &[String]) -> Launch {
+    let is_ps1 = shim
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ps1"));
+    if !is_ps1 {
+        return Launch {
+            program: shim.to_string_lossy().into_owned(),
+            args: args.to_vec(),
+        };
+    }
+    let mut final_args = vec![
+        "-NoProfile".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-File".to_string(),
+        shim.to_string_lossy().into_owned(),
+    ];
+    final_args.extend(args.iter().cloned());
+    Launch {
+        program: "powershell".to_string(),
+        args: final_args,
+    }
+}
+
+/// Rewrite a `wrap` invocation into what to launch. `path_env` is a seam for tests;
+/// `None` reads the live environment.
+fn resolve_launch(agent: &str, args: &[String], path_env: Option<&str>) -> Result<Launch> {
+    resolve_launch_for_platform(agent, args, path_env, cfg!(windows))
+}
+
+/// On Windows a shim (`.cmd`/`.bat`/`.ps1`) is a script, not an executable, so `Command`
+/// cannot run it by name — and `Command` never consults `PATHEXT`, which is why a bare
+/// `dsh` looked for `dsh.exe` and missed `dsh.cmd`. The resolved `.cmd`/`.bat` path is
+/// handed to `Command`, which wraps batch files in `cmd.exe` and escapes their arguments
+/// itself (refusing ones it cannot escape). `.ps1` goes through PowerShell `-File`.
+/// Everything else — a native binary, an unknown name, a POSIX shim (a shebang script) —
+/// passes through untouched.
+fn resolve_launch_for_platform(
+    agent: &str,
+    args: &[String],
+    path_env: Option<&str>,
+    is_windows: bool,
+) -> Result<Launch> {
+    if is_windows && let Some(Candidate::Script(shim)) = resolve_candidate(agent, path_env) {
+        return Ok(launch_for_script(shim, args));
+    }
+    Ok(Launch {
+        program: agent.to_string(),
+        args: args.to_vec(),
+    })
+}
+
+/// Launch the resolved program and propagate its exit code. This is the real-IO
+/// entrypoint (it spawns a subprocess), so it is left uncovered by unit tests — the
+/// testable logic lives in `parse_invocation` / `readiness` / `resolve_launch`.
+fn exec_agent(launch: &Launch, display: &str) -> Result<()> {
+    let mut cmd = std::process::Command::new(&launch.program);
+    cmd.args(&launch.args);
     // Always-sub skip-login: Claude Code must not require a live Anthropic OAuth session.
     // Only inject for Claude-ish binaries — never pollute codex/gemini/etc.
     // Prefer an already-set user value; only inject when missing so a real key still wins.
     if llmtrim_core::config::sub_skip_anthropic_login()
-        && agent_is_claude(&inv.agent)
+        && agent_is_claude(display)
         && std::env::var_os("ANTHROPIC_AUTH_TOKEN").is_none()
     {
         cmd.env(
@@ -168,16 +291,12 @@ fn exec_agent(inv: &WrapInvocation) -> Result<()> {
         );
     }
     let status = cmd.status().with_context(|| {
-        if KNOWN_AGENTS.contains(&inv.agent.as_str()) {
-            format!(
-                "failed to launch `{}`: is it installed and on your PATH?",
-                inv.agent
-            )
+        if KNOWN_AGENTS.contains(&display) {
+            format!("failed to launch `{display}`: is it installed and on your PATH?")
         } else {
             format!(
-                "failed to launch `{}`: not found on PATH (pass an installed binary, \
+                "failed to launch `{display}`: not found on PATH (pass an installed binary, \
                  e.g. one of: {})",
-                inv.agent,
                 KNOWN_AGENTS.join(", ")
             )
         }
@@ -193,6 +312,190 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Scratch dir for a shim fixture. The existing tests inline this pattern; the shim
+    /// tests all want it, so it is named once.
+    fn tempdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("llmtrim-wrap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn exe_wins_over_cmd_in_the_same_directory() {
+        let dir = tempdir("shadow");
+        std::fs::write(dir.join("tool.exe"), b"MZ").expect("exe");
+        std::fs::write(dir.join("tool.cmd"), "@echo off\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_candidate("tool", Some(&path)),
+            Some(Candidate::Native)
+        );
+    }
+
+    #[test]
+    fn earlier_path_directory_wins() {
+        let first = tempdir("first");
+        let second = tempdir("second");
+        std::fs::write(first.join("tool.cmd"), "@echo off\r\n").expect("shim");
+        std::fs::write(second.join("tool.cmd"), "@echo off\r\n").expect("other");
+        // `join_paths`, not a hardcoded `;`: that separator is Windows-only, so on Linux and
+        // macOS the two directories would read as one path and the probe would find nothing.
+        // It is the exact inverse of the `split_paths` the resolver calls.
+        let path = std::env::join_paths([&first, &second]).expect("join PATH");
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(
+            std::env::split_paths(&path).count(),
+            2,
+            "PATH must round-trip as two entries; a single entry means the join/parse pair \
+             regressed and this test would then pass on Windows only"
+        );
+        assert_eq!(
+            resolve_candidate("tool", Some(&path)),
+            Some(Candidate::Script(first.join("tool.cmd")))
+        );
+    }
+
+    #[test]
+    fn cmd_beats_ps1_within_a_directory() {
+        let dir = tempdir("order");
+        std::fs::write(dir.join("tool.cmd"), "@echo off\r\n").expect("cmd");
+        std::fs::write(dir.join("tool.ps1"), "Write-Output hi\r\n").expect("ps1");
+        let path = dir.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_candidate("tool", Some(&path)),
+            Some(Candidate::Script(dir.join("tool.cmd")))
+        );
+    }
+
+    #[test]
+    fn explicit_script_path_resolves_and_exe_path_does_not() {
+        let dir = tempdir("explicit");
+        let shim = dir.join("dsh.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("shim");
+        assert_eq!(
+            resolve_candidate(&shim.to_string_lossy(), None),
+            Some(Candidate::Script(shim.clone()))
+        );
+        let exe = dir.join("dsh.exe");
+        std::fs::write(&exe, b"MZ").expect("exe");
+        assert_eq!(
+            resolve_candidate(&exe.to_string_lossy(), None),
+            Some(Candidate::Native)
+        );
+    }
+
+    #[test]
+    fn missing_name_resolves_to_nothing() {
+        let dir = tempdir("missing");
+        assert_eq!(
+            resolve_candidate("nope", Some(&dir.to_string_lossy())),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_cmd_shim_is_launched_by_std() {
+        let dir = tempdir("cmd-launch");
+        let shim = dir.join("mytool.cmd");
+        std::fs::write(&shim, "@echo off\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let args = s(&["web"]);
+        let launch =
+            resolve_launch_for_platform("mytool", &args, Some(&path), true).expect("resolve");
+        // The shim path IS the program: std wraps .cmd/.bat in cmd.exe and escapes the args
+        // itself (CVE-2024-24576), so we must not build a command line by hand.
+        assert_eq!(launch.program, shim.to_string_lossy());
+        assert_eq!(launch.args, args);
+    }
+
+    #[test]
+    fn windows_ps1_launches_through_powershell() {
+        let dir = tempdir("ps1-launch");
+        let shim = dir.join("mytool.ps1");
+        std::fs::write(&shim, "Write-Output hi\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch =
+            resolve_launch_for_platform("mytool", &[], Some(&path), true).expect("resolve");
+        assert_eq!(launch.program, "powershell");
+        assert_eq!(
+            launch.args,
+            s(&[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &shim.to_string_lossy(),
+            ])
+        );
+    }
+
+    #[test]
+    fn native_and_unknown_agents_pass_through() {
+        let dir = tempdir("passthrough");
+        std::fs::write(dir.join("mytool.exe"), b"MZ").expect("exe");
+        let path = dir.to_string_lossy().into_owned();
+        let native =
+            resolve_launch_for_platform("mytool", &[], Some(&path), true).expect("resolve");
+        assert_eq!(native.program, "mytool");
+        let unknown = resolve_launch_for_platform("nope", &[], Some(&path), true).expect("resolve");
+        assert_eq!(unknown.program, "nope");
+    }
+
+    /// The launcher's contract is "never silent": the code this replaced dropped arguments
+    /// and reported success, which string assertions could not see. This spawns for real.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_shim_receives_its_arguments() {
+        let dir = tempdir("spawn");
+        let shim = dir.join("echoer.cmd");
+        std::fs::write(&shim, "@echo off\r\necho [%~1][%~2]\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch =
+            resolve_launch_for_platform("echoer", &s(&["plain", "has space"]), Some(&path), true)
+                .expect("resolve");
+        let out = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .output()
+            .expect("spawn");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("[plain]"), "stdout was {text:?}");
+        assert!(text.contains("[has space]"), "stdout was {text:?}");
+    }
+
+    /// A character cmd.exe treats specially: delivered intact, or refused by `Command` —
+    /// never silently dropped.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_shim_never_silently_drops_a_metacharacter_argument() {
+        let dir = tempdir("spawn-meta");
+        let shim = dir.join("echoer.cmd");
+        std::fs::write(&shim, "@echo off\r\necho [%1]\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch = resolve_launch_for_platform("echoer", &s(&["a&b"]), Some(&path), true)
+            .expect("resolve");
+        // Delivered intact, or refused by `Command` for being unescapable in a batch file
+        // (fail-closed and loud, where the old code was fail-silent). Only the Ok branch has
+        // anything to assert: an argument that arrives must not be mangled.
+        if let Ok(out) = std::process::Command::new(&launch.program)
+            .args(&launch.args)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains("a&b"), "argument was mangled: {text:?}");
+        }
+    }
+
+    #[test]
+    fn unix_shim_passes_through_untouched() {
+        let dir = tempdir("unix-shim");
+        std::fs::write(dir.join("mytool.cmd"), "@echo off\r\n").expect("shim");
+        let path = dir.to_string_lossy().into_owned();
+        let launch =
+            resolve_launch_for_platform("mytool", &[], Some(&path), false).expect("resolve");
+        assert_eq!(launch.program, "mytool");
     }
 
     #[test]
