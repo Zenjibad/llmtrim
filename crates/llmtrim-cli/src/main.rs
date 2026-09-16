@@ -629,9 +629,8 @@ enum AuthAction {
 enum McpAction {
     /// Register the llmtrim MCP server with your MCP client
     ///
-    /// Claude Code is installed through its own `claude mcp add` CLI (idempotent — re-running
-    /// is a no-op). DeepSeek Harness is registered by writing its user patch layer
-    /// (`$DSH_HOME/cordis.patch.yml`). `--print` writes nothing and emits the config.
+    /// `--client` picks the client (default `claude`). `--print` emits that client's config
+    /// instead of writing anything.
     Install {
         /// Print the client config instead of installing it.
         #[arg(long)]
